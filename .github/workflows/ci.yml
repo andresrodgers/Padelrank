@@ -25,5 +25,8 @@ jobs:
           pip install -r requirements.txt
 
       - name: Import check
+        env:
+          DATABASE_URL: postgresql+psycopg://padel:padel@localhost:5432/padel_mvp
+          JWT_SECRET: ci_dummy_secret
         run: |
           python -c "import app; import app.main"
