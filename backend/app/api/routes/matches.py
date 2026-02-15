@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.security import now_utc
-from app.db.session import get_db
+from app.db.session import get_db, engine
 from app.services.audit import audit
 from app.services.elo import compute_elo
 
@@ -21,6 +21,7 @@ from app.schemas.match import (
     MatchConfirmationsOut, MatchConfirmationRowOut,
     MatchDetailOut, MatchParticipantOut, MatchScoreOut,
 )
+
 
 router = APIRouter()
 
@@ -34,14 +35,34 @@ def _assert_is_participant(db: Session, match_id: str, user_id: str):
         raise HTTPException(403, "Not a participant")
 
 def _assert_block_rules(db: Session, user_id):
+    uid = str(user_id)
+
     pending = db.execute(sa.text("""
-        SELECT count(*) FROM matches
-        WHERE created_by=:u AND status='pending_confirm' AND now()<=confirmation_deadline
-    """), {"u": user_id}).scalar_one()
-    expired = db.execute(sa.text("""
-        SELECT count(*) FROM matches
-        WHERE created_by=:u AND status='expired' AND confirmation_deadline < now() AND created_at >= (now() - interval '30 days')
-    """), {"u": user_id}).scalar_one()
+        SELECT count(*)
+        FROM matches
+        WHERE created_by=:u
+          AND status='pending_confirm'
+          AND confirmation_deadline >= now()
+    """), {"u": uid}).scalar_one()
+
+    expired_effective = db.execute(sa.text("""
+        SELECT count(*)
+        FROM matches
+        WHERE created_by=:u
+          AND status='pending_confirm'
+          AND confirmation_deadline < now()
+          AND created_at >= (now() - interval '30 days')
+    """), {"u": uid}).scalar_one()
+
+    expired_materialized = db.execute(sa.text("""
+        SELECT count(*)
+        FROM matches
+        WHERE created_by=:u
+          AND status='expired'
+          AND created_at >= (now() - interval '30 days')
+    """), {"u": uid}).scalar_one()
+
+    expired = int(expired_effective) + int(expired_materialized)
 
     if pending >= 2 or expired >= 1:
         raise HTTPException(403, "Blocked from creating new match (pending/expired limit)")
@@ -79,66 +100,40 @@ def _require_ladder_states(db: Session, ladder_code: str, participant_ids: list[
         raise HTTPException(400, f"All participants must have ladder state for {ladder_code}. Complete profile (category) first.")
 
 def _derive_match_category_id(db: Session, ladder_code: str, participants, participant_ids: list[UUID]) -> str:
-    # HM/WM: categoría del partido = jugador más fuerte (anti-sandbagging) => min sort_order
-    if ladder_code in ("HM", "WM"):
-        rows = db.execute(sa.text("""
-            SELECT s.user_id::text as user_id, c.sort_order
-            FROM user_ladder_state s
-            JOIN categories c ON c.id=s.category_id
-            WHERE s.ladder_code=:l AND s.user_id = ANY(:ids)
-        """), {"l": ladder_code, "ids": participant_ids}).mappings().all()
-        if len(rows) != 4:
-            raise HTTPException(400, "Missing ladder state/category for participants")
+    """
+    C3.1: category_id del match = categoría mediana de los 4 participantes (por sort_order)
+    en el ladder del match (HM/WM/MX). Solo etiqueta para analítica.
+    """
+    rows = db.execute(sa.text("""
+        SELECT c.sort_order
+        FROM user_ladder_state s
+        JOIN categories c ON c.id = s.category_id
+        WHERE s.ladder_code = :l
+          AND s.user_id = ANY(:ids)
+    """), {"l": ladder_code, "ids": participant_ids}).mappings().all()
 
-        min_sort = min(int(r["sort_order"]) for r in rows)
-        cat = db.execute(sa.text("""
-            SELECT id::text as id
-            FROM categories
-            WHERE ladder_code=:l AND sort_order=:o
-            LIMIT 1
-        """), {"l": ladder_code, "o": min_sort}).mappings().first()
-        if not cat:
-            raise HTTPException(400, "Could not derive match category")
-        return cat["id"]
+    if len(rows) != 4:
+        raise HTTPException(400, "Missing ladder state/category for participants")
 
-    # MX: se calcula por equipo (promedio y techo), y el equipo más fuerte define la categoría del match
-    if ladder_code == "MX":
-        rows = db.execute(sa.text("""
-            SELECT s.user_id::text as user_id, c.sort_order
-            FROM user_ladder_state s
-            JOIN categories c ON c.id=s.category_id
-            WHERE s.ladder_code='MX' AND s.user_id = ANY(:ids)
-        """), {"ids": participant_ids}).mappings().all()
-        if len(rows) != 4:
-            raise HTTPException(400, "Missing MX ladder state/category for participants")
+    sort_orders = sorted(int(r["sort_order"]) for r in rows)
 
-        score_by_user = {r["user_id"]: int(r["sort_order"]) for r in rows}
+    median_val = (sort_orders[1] + sort_orders[2]) / 2.0
 
-        t1 = [p for p in participants if p.team_no == 1]
-        t2 = [p for p in participants if p.team_no == 2]
-        if len(t1) != 2 or len(t2) != 2:
-            raise HTTPException(400, "Each team must have 2 participants")
+    target = int(math.ceil(median_val))
+    cats = db.execute(sa.text("""
+        SELECT id::text as id, sort_order
+        FROM categories
+        WHERE ladder_code = :l
+    """), {"l": ladder_code}).mappings().all()
 
-        def team_score(team_parts):
-            s1 = score_by_user[team_parts[0].user_id]
-            s2 = score_by_user[team_parts[1].user_id]
-            return int(math.ceil((s1 + s2) / 2.0))
+    if not cats:
+        raise HTTPException(400, "No categories for ladder")
 
-        team1_score = team_score(t1)
-        team2_score = team_score(t2)
-        match_score = min(team1_score, team2_score)  # A es 1 (más fuerte)
-
-        cat = db.execute(sa.text("""
-            SELECT id::text as id
-            FROM categories
-            WHERE ladder_code='MX' AND sort_order=:o
-            LIMIT 1
-        """), {"o": match_score}).mappings().first()
-        if not cat:
-            raise HTTPException(400, "Could not derive MX match category")
-        return cat["id"]
-
-    raise HTTPException(400, "Invalid ladder")
+    best = min(
+        cats,
+        key=lambda c: (abs(int(c["sort_order"]) - target), int(c["sort_order"]))
+    )
+    return best["id"]
 
 @router.post("", response_model=MatchOut)
 def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
@@ -202,12 +197,29 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
         VALUES (:m, CAST(:s AS jsonb), :w)
     """), {"m": match_id, "s": json.dumps(payload.score.score_json), "w": winner_team})
 
+    creator_id = str(current.id)
+    participant_str_ids = {str(x) for x in participant_ids}
+    creator_is_participant = creator_id in participant_str_ids
 
     for uid in participant_ids:
-        db.execute(sa.text("""
-            INSERT INTO match_confirmations (match_id, user_id, status)
-            VALUES (:m, :u, 'pending')
-        """), {"m": match_id, "u": str(uid)})
+        uid_str = str(uid)
+        if uid_str == creator_id:
+            db.execute(sa.text("""
+                INSERT INTO match_confirmations (match_id, user_id, status, decided_at, source)
+                VALUES (:m, :u, 'confirmed', now(), 'creator')
+            """), {"m": match_id, "u": uid_str})
+        else:
+            db.execute(sa.text("""
+                INSERT INTO match_confirmations (match_id, user_id, status)
+                VALUES (:m, :u, 'pending')
+            """), {"m": match_id, "u": uid_str})
+
+    # confirmed_count inicial (1 si el creador está dentro de los 4)
+    db.execute(sa.text("""
+        UPDATE matches
+        SET confirmed_count=:c
+        WHERE id=:m
+    """), {"c": 1 if creator_is_participant else 0, "m": match_id})
 
     audit(db, current.id, "match", str(match_id), "created", {
         "ladder_code": ladder_code,
@@ -229,10 +241,23 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
 @router.get("/{match_id}", response_model=MatchOut)
 def get_match(match_id: str, db: Session = Depends(get_db)):
     row = db.execute(sa.text("""
-        SELECT id::text as id, ladder_code, category_id::text as category_id, club_id::text as club_id,
-               played_at, created_by::text as created_by, status, confirmation_deadline,
-               confirmed_count, has_dispute
-        FROM matches WHERE id=:m
+        SELECT
+            id::text as id,
+            ladder_code,
+            category_id::text as category_id,
+            club_id::text as club_id,
+            played_at,
+            created_by::text as created_by,
+            CASE
+                WHEN status='pending_confirm' AND confirmation_deadline < now()
+                    THEN 'expired'
+                ELSE status
+            END as status,
+            confirmation_deadline,
+            confirmed_count,
+            has_dispute
+        FROM matches
+        WHERE id=:m
     """), {"m": match_id}).mappings().first()
     if not row:
         raise HTTPException(404, "Match not found")
@@ -372,10 +397,19 @@ def match_confirmations(match_id: str, current=Depends(get_current_user), db: Se
     _assert_is_participant(db, match_id, str(current.id))
 
     m = db.execute(sa.text("""
-        SELECT id::text as match_id, status, confirmation_deadline, confirmed_count, has_dispute
+        SELECT
+            id::text as match_id,
+            CASE
+                WHEN status='pending_confirm' AND confirmation_deadline < now()
+                    THEN 'expired'
+                ELSE status
+            END as status,
+            confirmation_deadline,
+            has_dispute
         FROM matches
         WHERE id=:m
     """), {"m": match_id}).mappings().first()
+
     if not m:
         raise HTTPException(404, "Match not found")
 
@@ -394,11 +428,14 @@ def match_confirmations(match_id: str, current=Depends(get_current_user), db: Se
         ORDER BY mp.team_no, up.alias
     """), {"m": match_id}).mappings().all()
 
+    # confirmed_count siempre desde la “verdad”: match_confirmations (solo lectura)
+    confirmed_count = sum(1 for r in rows if r["status"] == "confirmed")
+
     return MatchConfirmationsOut(
         match_id=m["match_id"],
-        status=m["status"],
+        status=m["status"],  # aquí ya viene “expired” si venció
         confirmation_deadline=m["confirmation_deadline"],
-        confirmed_count=m["confirmed_count"],
+        confirmed_count=int(confirmed_count),
         has_dispute=m["has_dispute"],
         rows=[MatchConfirmationRowOut(**r) for r in rows],
     )
@@ -428,6 +465,36 @@ def match_detail(match_id: str, current=Depends(get_current_user), db: Session =
     """), {"m": match_id}).mappings().first()
     if not m:
         raise HTTPException(404, "Match not found")
+    
+    # Lazy-expire: si venció y seguía pendiente, reflejarlo
+    if m["status"] == "pending_confirm" and m["confirmation_deadline"] < now_utc():
+        db.execute(sa.text("""
+            UPDATE matches
+            SET status='expired'
+            WHERE id=:m AND status='pending_confirm'
+        """), {"m": match_id})
+        
+        db.commit()
+        
+        m = db.execute(sa.text("""
+            SELECT
+                m.id::text as id,
+                m.ladder_code,
+                m.category_id::text as category_id,
+                c.code as category_code,
+                m.club_id::text as club_id,
+                cl.name as club_name,
+                m.played_at,
+                m.created_by::text as created_by,
+                m.status,
+                m.confirmation_deadline,
+                m.confirmed_count,
+                m.has_dispute
+            FROM matches m
+            JOIN categories c ON c.id = m.category_id
+            LEFT JOIN clubs cl ON cl.id = m.club_id
+            WHERE m.id=:m
+        """), {"m": match_id}).mappings().first()
 
     parts = db.execute(sa.text("""
         SELECT
@@ -456,17 +523,20 @@ def match_detail(match_id: str, current=Depends(get_current_user), db: Session =
 
 @router.post("/{match_id}/confirm")
 def confirm_match(match_id: str, payload: ConfirmIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
-    if payload.status not in ("confirmed", "disputed"):
-        raise HTTPException(400, "status must be confirmed or disputed")
+    # Solo se permite confirmar
+    if payload.status != "confirmed":
+        raise HTTPException(400, "status must be confirmed")
 
+    # Debe ser participante
     is_part = db.execute(sa.text("""
         SELECT 1 FROM match_participants WHERE match_id=:m AND user_id=:u
     """), {"m": match_id, "u": str(current.id)}).first()
     if not is_part:
         raise HTTPException(403, "Not a participant")
 
+    # Match existe y está confirmable
     m = db.execute(sa.text("""
-        SELECT status, confirmation_deadline, has_dispute
+        SELECT status, confirmation_deadline
         FROM matches WHERE id=:m
     """), {"m": match_id}).mappings().first()
     if not m:
@@ -474,38 +544,68 @@ def confirm_match(match_id: str, payload: ConfirmIn, current=Depends(get_current
 
     if m["status"] in ("expired", "void"):
         raise HTTPException(400, "Match not confirmable")
+
     if now_utc() > m["confirmation_deadline"]:
+        db.execute(sa.text("""
+            UPDATE matches
+            SET status='expired'
+            WHERE id=:m AND status='pending_confirm'
+        """), {"m": match_id})
+        db.commit()
         raise HTTPException(400, "Confirmation window expired")
 
+    # Registrar confirmación (idempotente para ese usuario)
     db.execute(sa.text("""
         UPDATE match_confirmations
-        SET status=:s, decided_at=now(), note=:n, source=:src
+        SET status='confirmed', decided_at=now(), note=:n, source=:src
         WHERE match_id=:m AND user_id=:u
-    """), {"s": payload.status, "n": payload.note, "src": payload.source, "m": match_id, "u": str(current.id)})
+    """), {"n": payload.note, "src": payload.source, "m": match_id, "u": str(current.id)})
 
-    if payload.status == "disputed":
-        db.execute(sa.text("UPDATE matches SET has_dispute=true, status='disputed' WHERE id=:m"), {"m": match_id})
-        db.execute(sa.text("""
-            INSERT INTO match_disputes (match_id, opened_by, reason_code, comment, status)
-            VALUES (:m, :u, 'USER_DISPUTE', :c, 'open')
-            ON CONFLICT (match_id) DO NOTHING
-        """), {"m": match_id, "u": str(current.id), "c": payload.note})
-        audit(db, current.id, "match", match_id, "disputed", {"note": payload.note})
-        db.commit()
-        return {"ok": True, "status": "disputed"}
-
+    # Recalcular confirmed_count
     confirmed_count = db.execute(sa.text("""
-        SELECT count(*) FROM match_confirmations WHERE match_id=:m AND status='confirmed'
+        SELECT count(*)
+        FROM match_confirmations
+        WHERE match_id=:m AND status='confirmed'
     """), {"m": match_id}).scalar_one()
 
-    db.execute(sa.text("UPDATE matches SET confirmed_count=:c WHERE id=:m"), {"c": confirmed_count, "m": match_id})
-    audit(db, current.id, "confirmation", f"{match_id}:{current.id}", "confirmed", {})
+    db.execute(sa.text("""
+        UPDATE matches
+        SET confirmed_count=:c
+        WHERE id=:m
+    """), {"c": int(confirmed_count), "m": match_id})
 
-    m2 = db.execute(sa.text("SELECT has_dispute FROM matches WHERE id=:m"), {"m": match_id}).mappings().first()
-    if confirmed_count >= 3 and not m2["has_dispute"]:
-        db.execute(sa.text("UPDATE matches SET status='verified' WHERE id=:m"), {"m": match_id})
-        audit(db, None, "match", match_id, "verified", {"confirmed_count": confirmed_count})
+    # Confirmación cruzada: mínimo 1 por cada equipo
+    teams_confirmed = db.execute(sa.text("""
+        SELECT count(DISTINCT mp.team_no)
+        FROM match_confirmations mc
+        JOIN match_participants mp
+          ON mp.match_id = mc.match_id
+         AND mp.user_id  = mc.user_id
+        WHERE mc.match_id=:m
+          AND mc.status='confirmed'
+    """), {"m": match_id}).scalar_one()
+
+    # Si ya hay confirmación cruzada, verificar y aplicar ranking
+    m2 = db.execute(sa.text("""
+        SELECT status
+        FROM matches
+        WHERE id=:m
+    """), {"m": match_id}).mappings().first()
+
+    if int(teams_confirmed) >= 2 and m2["status"] != "verified":
+        db.execute(sa.text("""
+            UPDATE matches
+            SET status='verified'
+            WHERE id=:m
+        """), {"m": match_id})
+
+        audit(db, None, "match", match_id, "verified", {
+            "confirmed_count": int(confirmed_count),
+            "teams_confirmed": int(teams_confirmed),
+        })
+
         _apply_ranking_for_match(db, match_id)
 
+    audit(db, current.id, "confirmation", f"{match_id}:{current.id}", "confirmed", {})
     db.commit()
-    return {"ok": True, "confirmed_count": confirmed_count}
+    return {"ok": True, "confirmed_count": int(confirmed_count), "teams_confirmed": int(teams_confirmed)}

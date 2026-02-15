@@ -1,6 +1,7 @@
 from datetime import datetime
 from pydantic import BaseModel, Field, field_validator
 from typing import Any
+from typing import Literal, Optional, Dict, Any
 
 class ParticipantIn(BaseModel):
     user_id: str
@@ -103,10 +104,13 @@ class MatchOut(BaseModel):
     has_dispute: bool
 
 class ConfirmIn(BaseModel):
-    status: str = Field(..., description="confirmed|disputed")
-    note: str | None = None
-    source: str | None = "app"
+    status: Literal["confirmed"]
+    note: Optional[str] = None
+    source: Optional[str] = None
 
+    # Si viene, significa "proponer corrección" (o confirmar ese score)
+    score_json: Optional[Dict[str, Any]] = None
+    
 class MyMatchRowOut(BaseModel):
     id: str
     ladder_code: str
