@@ -86,6 +86,77 @@ def me(current=Depends(get_current_user), db: Session = Depends(get_db)):
         status=current.status,
         profile=profile,
     )
+    
+@router.patch("/profile", response_model=MeOut)
+def update_profile(payload: ProfileUpdateIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
+    # 1) leer perfil actual
+    prof = db.execute(sa.text("""
+        SELECT alias, gender, is_public
+        FROM user_profiles
+        WHERE user_id=:u
+    """), {"u": current.id}).mappings().first()
+    if not prof:
+        raise HTTPException(400, "Profile missing")
+
+    # 2) alias único si se cambia
+    if payload.alias:
+        exists = db.execute(sa.text("""
+            SELECT 1
+            FROM user_profiles
+            WHERE alias=:a AND user_id<>:u
+        """), {"a": payload.alias, "u": current.id}).first()
+        if exists:
+            raise HTTPException(400, "Alias already taken")
+
+    # 3) gender válido
+    if payload.gender is not None and payload.gender not in ("M", "F"):
+        raise HTTPException(400, "Gender must be M or F")
+
+    # 4) update en user_profiles (solo lo que venga)
+    updates = []
+    params = {"u": current.id}
+
+    if payload.alias is not None:
+        updates.append("alias=:alias")
+        params["alias"] = payload.alias
+
+    if payload.gender is not None:
+        updates.append("gender=:gender")
+        params["gender"] = payload.gender
+
+    if payload.is_public is not None:
+        updates.append("is_public=:is_public")
+        params["is_public"] = payload.is_public
+
+    if updates:
+        db.execute(sa.text(f"""
+            UPDATE user_profiles
+            SET {', '.join(updates)}, updated_at=now()
+            WHERE user_id=:u
+        """), params)
+
+    gender_eff = payload.gender if payload.gender is not None else prof["gender"]
+
+    if payload.primary_category_code is not None:
+        primary_ladder = "HM" if gender_eff == "M" else "WM"
+
+        primary_cat_id = _get_category_id_by_code(db, primary_ladder, payload.primary_category_code)
+        _upsert_ladder_state(db, current.id, primary_ladder, primary_cat_id)
+
+        mx_code = _get_mx_code_from_map(db, gender_eff, payload.primary_category_code)
+        mx_cat_id = _get_category_id_by_code(db, "MX", mx_code)
+        _upsert_ladder_state(db, current.id, "MX", mx_cat_id)
+
+    # 6) audit + commit
+    audit(db, current.id, "profile", str(current.id), "updated", {
+        "alias": payload.alias,
+        "gender": payload.gender,
+        "is_public": payload.is_public,
+        "primary_category_code": payload.primary_category_code,
+    })
+
+    db.commit()
+    return me(current=current, db=db)
 
 @router.get("/ladder-states", response_model=list[LadderStateOut])
 def my_ladder_states(current=Depends(get_current_user), db: Session = Depends(get_db)):
