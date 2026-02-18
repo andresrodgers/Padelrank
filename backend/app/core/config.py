@@ -4,6 +4,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=None, extra="ignore")
 
     ENV: str = "dev"
+    
+    MAX_SCORE_PROPOSALS: int = 2
 
     DATABASE_URL: str
 

@@ -1,34 +1,44 @@
 @"
-# Python
+# --- Python ---
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
+coverage.xml
 htmlcov/
-
-# Envs
-.env
-.env.*
-!.env.example
-
-# Secrets / tokens
-tokens.json
-*.pem
-*.key
-
-# Virtual env
+.pyre/
 .venv/
 venv/
+ENV/
+env/
 
-# OS/IDE
+# --- FastAPI / Uvicorn ---
+*.log
+
+# --- OS ---
 .DS_Store
 Thumbs.db
-.vscode/
 
-# Local artifacts
-tree.txt
-"@ | Out-File -Encoding utf8 .gitignore
+# --- VSCode / IDE ---
+.vscode/
+.idea/
+
+# --- Docker ---
+**/.env
+.env.*
+
+# --- Local data / temp ---
+*.sqlite3
+*.db
+tmp/
+temp/
+"@ | Set-Content -Encoding UTF8 .gitignore

@@ -94,7 +94,7 @@ def otp_verify(payload: OTPVerifyIn, db: Session = Depends(get_db)):
         # For now we set 'M' as placeholder and force update later if needed.
         db.execute(sa.text("""
             INSERT INTO user_profiles (user_id, alias, gender, is_public)
-            VALUES (:u, :a, 'M', true)
+            VALUES (:u, :a, 'U', true)
         """), {"u": user_id, "a": alias})
 
     audit(db, user_id, "auth", str(user_id), "login", {})

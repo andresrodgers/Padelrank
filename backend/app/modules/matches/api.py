@@ -17,11 +17,10 @@ from app.services.elo import compute_elo
 from app.services.score_features import extract_score_features, mov_weight_from_features
 
 from app.schemas.match import (
-    MatchCreateIn, MatchOut, ConfirmIn,
+    MatchCreateIn, MatchOut, ConfirmIn, ConfirmOut, MatchScoreIn,
     MatchConfirmationsOut, MatchConfirmationRowOut,
     MatchDetailOut, MatchParticipantOut, MatchScoreOut,
 )
-
 
 router = APIRouter()
 
@@ -67,17 +66,22 @@ def _assert_block_rules(db: Session, user_id):
     if pending >= 2 or expired >= 1:
         raise HTTPException(403, "Blocked from creating new match (pending/expired limit)")
 
-def _fetch_profiles(db: Session, participant_ids: list[UUID]):
-    rows = db.execute(sa.text("""
-        SELECT user_id::text as user_id, gender
-        FROM user_profiles
-        WHERE user_id = ANY(:ids)
-    """), {"ids": participant_ids}).mappings().all()
-    if len(rows) != 4:
-        raise HTTPException(400, "All participants must have profiles")
-    if any(r["gender"] not in ("M", "F") for r in rows):
-        raise HTTPException(400, "Participants must have gender M/F")
-    return rows
+def _fetch_profiles(db: Session, user_ids: list[UUID]):
+    ids_bp = sa.bindparam("ids", expanding=True)
+
+    rows = db.execute(
+        sa.text("""
+            SELECT
+                user_id::text AS user_id,
+                alias,
+                gender
+            FROM user_profiles
+            WHERE user_id::text IN :ids
+        """).bindparams(ids_bp),
+        {"ids": [str(x) for x in user_ids]},
+    ).mappings().all()
+
+    return [dict(r) for r in rows]
 
 def _determine_ladder_from_genders(genders: list[str]) -> str:
     m = genders.count("M")
@@ -88,7 +92,7 @@ def _determine_ladder_from_genders(genders: list[str]) -> str:
         return "WM"
     if m == 2 and f == 2:
         return "MX"
-    raise HTTPException(400, "Invalid gender mix. Use 4M (HM), 4F (WM) or 2M2F (MX)")
+    raise HTTPException(400, "Combinación de géneros no válida. Utilice 4M (HM), 4F (WM) o 2M2F (MX).")
 
 def _require_ladder_states(db: Session, ladder_code: str, participant_ids: list[UUID]):
     cnt = int(db.execute(sa.text("""
@@ -97,7 +101,7 @@ def _require_ladder_states(db: Session, ladder_code: str, participant_ids: list[
         WHERE ladder_code=:l AND user_id = ANY(:ids)
     """), {"l": ladder_code, "ids": participant_ids}).scalar_one())
     if cnt != 4:
-        raise HTTPException(400, f"All participants must have ladder state for {ladder_code}. Complete profile (category) first.")
+        raise HTTPException(400, f"Todos los participantes deben tener el estado de rango para {ladder_code}. Completa primero el perfil (categoría).")
 
 def _derive_match_category_id(db: Session, ladder_code: str, participants, participant_ids: list[UUID]) -> str:
     """
@@ -113,7 +117,7 @@ def _derive_match_category_id(db: Session, ladder_code: str, participants, parti
     """), {"l": ladder_code, "ids": participant_ids}).mappings().all()
 
     if len(rows) != 4:
-        raise HTTPException(400, "Missing ladder state/category for participants")
+        raise HTTPException(400, "Falta el estado/categoría de la tabla para los participantes.")
 
     sort_orders = sorted(int(r["sort_order"]) for r in rows)
 
@@ -127,7 +131,7 @@ def _derive_match_category_id(db: Session, ladder_code: str, participants, parti
     """), {"l": ladder_code}).mappings().all()
 
     if not cats:
-        raise HTTPException(400, "No categories for ladder")
+        raise HTTPException(400, "No hay categorías para la tabla")
 
     best = min(
         cats,
@@ -140,30 +144,92 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
     _assert_block_rules(db, current.id)
 
     if len(payload.participants) != 4:
-        raise HTTPException(400, "Must include exactly 4 participants")
+        raise HTTPException(400, "Debe incluir exactamente 4 participantes")
 
     try:
         participant_ids = [UUID(p.user_id) for p in payload.participants]
     except Exception:
-        raise HTTPException(400, "Invalid participant user_id format")
+        raise HTTPException(400, "Formato de ID de participante inválido")
 
     if len(set(participant_ids)) != 4:
-        raise HTTPException(400, "Participants must be unique")
+        raise HTTPException(400, "Los participantes deben ser únicos.")
 
     t1 = [p for p in payload.participants if p.team_no == 1]
     t2 = [p for p in payload.participants if p.team_no == 2]
     if len(t1) != 2 or len(t2) != 2:
-        raise HTTPException(400, "Each team must have 2 participants")
+        raise HTTPException(400, "Cada equipo debe tener 2 participantes")
 
     if payload.club_id is not None:
         ok = db.execute(sa.text("SELECT 1 FROM clubs WHERE id=:c AND is_active=true"), {"c": payload.club_id}).first()
         if not ok:
-            raise HTTPException(400, "Club not found or inactive")
+            raise HTTPException(400, "Club no encontrado o inactivo")
 
     profiles = _fetch_profiles(db, participant_ids)
-    ladder_code = _determine_ladder_from_genders([r["gender"] for r in profiles])
+    profiles_by_id = {UUID(p["user_id"]): p for p in profiles if p.get("user_id")}
 
-    _require_ladder_states(db, ladder_code, participant_ids)
+    missing_profiles = [uid for uid in participant_ids if uid not in profiles_by_id]
+    if missing_profiles:
+        raise HTTPException(
+            status_code=403,
+            detail="No se puede crear/invitar a partidos: todos los jugadores deben tener perfil creado."
+        )
+
+    def is_placeholder(alias: str | None) -> bool:
+        return (alias is None) or alias.startswith("player_")
+
+    bad = set()
+
+    for uid in participant_ids:
+        p = profiles_by_id[uid]
+        if is_placeholder(p.get("alias")):
+            bad.add("usuario")
+        if p.get("gender") not in ("M", "F"):
+            bad.add("género")
+
+    if "género" in bad:
+        raise HTTPException(
+            status_code=403,
+            detail="No se puede crear/invitar a partidos: todos los jugadores deben completar su perfil (usuario, género y categoría)."
+        )
+
+    ladder_code = _determine_ladder_from_genders([profiles_by_id[uid]["gender"] for uid in participant_ids])
+
+    ids_bp = sa.bindparam("ids", expanding=True)
+
+    rows = db.execute(
+        sa.text("""
+            SELECT user_id::text AS user_id
+            FROM user_ladder_state
+            WHERE ladder_code = :ladder
+            AND user_id::text IN :ids
+        """).bindparams(ids_bp),
+        {"ladder": ladder_code, "ids": [str(x) for x in participant_ids]},
+    ).mappings().all()
+    
+    import logging
+    logger = logging.getLogger(__name__)
+
+    aliases_dbg = {
+        str(uid): {
+            "alias": profiles_by_id[uid].get("alias"),
+            "gender": profiles_by_id[uid].get("gender"),
+            "keys": list(profiles_by_id[uid].keys()),
+        }
+        for uid in participant_ids
+    }
+    logger.warning({"aliases_dbg": aliases_dbg, "ladder_code": ladder_code})
+
+    has_state = {UUID(r["user_id"]) for r in rows}
+    missing_category = [uid for uid in participant_ids if uid not in has_state]
+    if missing_category:
+        bad.add("categoría")
+
+    if bad:
+        raise HTTPException(
+            status_code=403,
+            detail="No se puede crear/invitar a partidos: todos los jugadores deben completar su perfil (usuario, género y categoría)."
+        )
+
     category_id = _derive_match_category_id(db, ladder_code, payload.participants, participant_ids)
 
     deadline = now_utc() + timedelta(hours=settings.CONFIRM_WINDOW_HOURS)
@@ -190,7 +256,7 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
     winner_team = payload.score.derived_winner()
 
     if payload.score.winner_team_no is not None and payload.score.winner_team_no != winner_team:
-        raise HTTPException(400, "winner_team_no does not match derived winner from sets")
+        raise HTTPException(400, "Equipo ganador no coincide con el ganador derivado de los conjuntos")
 
     db.execute(sa.text("""
         INSERT INTO match_scores (match_id, score_json, winner_team_no)
@@ -214,7 +280,6 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
                 VALUES (:m, :u, 'pending')
             """), {"m": match_id, "u": uid_str})
 
-    # confirmed_count inicial (1 si el creador está dentro de los 4)
     db.execute(sa.text("""
         UPDATE matches
         SET confirmed_count=:c
@@ -428,12 +493,11 @@ def match_confirmations(match_id: str, current=Depends(get_current_user), db: Se
         ORDER BY mp.team_no, up.alias
     """), {"m": match_id}).mappings().all()
 
-    # confirmed_count siempre desde la “verdad”: match_confirmations (solo lectura)
     confirmed_count = sum(1 for r in rows if r["status"] == "confirmed")
 
     return MatchConfirmationsOut(
         match_id=m["match_id"],
-        status=m["status"],  # aquí ya viene “expired” si venció
+        status=m["status"], 
         confirmation_deadline=m["confirmation_deadline"],
         confirmed_count=int(confirmed_count),
         has_dispute=m["has_dispute"],
@@ -466,7 +530,6 @@ def match_detail(match_id: str, current=Depends(get_current_user), db: Session =
     if not m:
         raise HTTPException(404, "Match not found")
     
-    # Lazy-expire: si venció y seguía pendiente, reflejarlo
     if m["status"] == "pending_confirm" and m["confirmation_deadline"] < now_utc():
         db.execute(sa.text("""
             UPDATE matches
@@ -508,12 +571,16 @@ def match_detail(match_id: str, current=Depends(get_current_user), db: Session =
     """), {"m": match_id}).mappings().all()
 
     score = db.execute(sa.text("""
-        SELECT score_json, winner_team_no
-        FROM match_scores
-        WHERE match_id=:m
+        SELECT
+        COALESCE(m.proposed_score_json::jsonb, ms.score_json::jsonb) AS score_json,
+        COALESCE(m.proposed_winner_team_no, ms.winner_team_no)       AS winner_team_no
+        FROM matches m
+        JOIN match_scores ms ON ms.match_id = m.id
+        WHERE m.id=:m
     """), {"m": match_id}).mappings().first()
+
     if not score:
-        raise HTTPException(500, "Match score missing")
+        raise HTTPException(500, "Falta el resultado del partido.")
 
     return MatchDetailOut(
         **m,
@@ -521,91 +588,159 @@ def match_detail(match_id: str, current=Depends(get_current_user), db: Session =
         score=MatchScoreOut(score_json=score["score_json"], winner_team_no=int(score["winner_team_no"])),
     )
 
-@router.post("/{match_id}/confirm")
+@router.post("/{match_id}/confirm", response_model=ConfirmOut)
 def confirm_match(match_id: str, payload: ConfirmIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
-    # Solo se permite confirmar
-    if payload.status != "confirmed":
-        raise HTTPException(400, "status must be confirmed")
+    _assert_is_participant(db, match_id, str(current.id))
 
-    # Debe ser participante
-    is_part = db.execute(sa.text("""
-        SELECT 1 FROM match_participants WHERE match_id=:m AND user_id=:u
-    """), {"m": match_id, "u": str(current.id)}).first()
-    if not is_part:
-        raise HTTPException(403, "Not a participant")
-
-    # Match existe y está confirmable
     m = db.execute(sa.text("""
-        SELECT status, confirmation_deadline
-        FROM matches WHERE id=:m
+        SELECT
+            id::text as match_id,
+            status,
+            confirmation_deadline,
+            proposal_count,
+            proposed_score_json,
+            proposed_winner_team_no
+        FROM matches
+        WHERE id=:m
+        FOR UPDATE
     """), {"m": match_id}).mappings().first()
+
     if not m:
-        raise HTTPException(404, "Match not found")
+        raise HTTPException(404, "Partido no encontrado")
 
-    if m["status"] in ("expired", "void"):
-        raise HTTPException(400, "Match not confirmable")
-
-    if now_utc() > m["confirmation_deadline"]:
+    if m["status"] == "pending_confirm" and m["confirmation_deadline"] < now_utc():
         db.execute(sa.text("""
             UPDATE matches
             SET status='expired'
             WHERE id=:m AND status='pending_confirm'
         """), {"m": match_id})
         db.commit()
-        raise HTTPException(400, "Confirmation window expired")
+        raise HTTPException(409, "Patido expirado")
 
-    # Registrar confirmación (idempotente para ese usuario)
+    if m["status"] != "pending_confirm":
+        raise HTTPException(
+            status_code=409,
+            detail=f"El partido no está pendiente de confirmación (estado={m['status']})."
+        )
+
+
+    active = db.execute(sa.text("""
+        SELECT
+        COALESCE(m.proposed_score_json::jsonb, ms.score_json::jsonb) AS score_json
+        FROM matches m
+        JOIN match_scores ms ON ms.match_id = m.id
+        WHERE m.id=:m
+    """), {"m": match_id}).mappings().first()
+
+    active_score_json = active["score_json"]
+
+    if payload.score_json is not None and payload.score_json != active_score_json:
+        if int(m["proposal_count"] or 0) >= settings.MAX_SCORE_PROPOSALS:
+            raise HTTPException(
+                status_code=409,
+                detail="Límite de apelaciones alcanzado (máximo 2)."
+            )
+
+        score_in = MatchScoreIn(score_json=payload.score_json)
+        winner_team_no = int(score_in.derived_winner())
+
+        db.execute(sa.text("""
+            UPDATE matches
+            SET
+              proposed_score_json = CAST(:s AS jsonb),
+              proposed_winner_team_no = :w,
+              proposed_by = :u,
+              proposed_at = now(),
+              proposal_count = proposal_count + 1
+            WHERE id=:m
+        """), {
+            "m": match_id,
+            "s": json.dumps(payload.score_json),
+            "w": winner_team_no,
+            "u": str(current.id),
+        })
+
+        db.execute(sa.text("""
+            UPDATE match_confirmations
+            SET status='pending', decided_at=NULL, note=NULL, source=NULL
+            WHERE match_id=:m
+        """), {"m": match_id})
+
+        db.execute(sa.text("""
+            UPDATE match_confirmations
+            SET status='confirmed', decided_at=now(), note=:note, source=:source
+            WHERE match_id=:m AND user_id=:u
+        """), {
+            "m": match_id,
+            "u": str(current.id),
+            "note": payload.note,
+            "source": payload.source,
+        })
+
+        db.execute(sa.text("""
+            UPDATE matches
+            SET confirmed_count=1
+            WHERE id=:m
+        """), {"m": match_id})
+
+        db.commit()
+        return ConfirmOut(ok=True, confirmed_count=1, teams_confirmed=1)
+
     db.execute(sa.text("""
         UPDATE match_confirmations
-        SET status='confirmed', decided_at=now(), note=:n, source=:src
+        SET status='confirmed', decided_at=now(), note=:note, source=:source
         WHERE match_id=:m AND user_id=:u
-    """), {"n": payload.note, "src": payload.source, "m": match_id, "u": str(current.id)})
+    """), {"m": match_id, "u": str(current.id), "note": payload.note, "source": payload.source})
 
-    # Recalcular confirmed_count
     confirmed_count = db.execute(sa.text("""
-        SELECT count(*)
+        SELECT count(*)::int as c
         FROM match_confirmations
         WHERE match_id=:m AND status='confirmed'
-    """), {"m": match_id}).scalar_one()
+    """), {"m": match_id}).mappings().first()["c"]
+
+    teams_confirmed = db.execute(sa.text("""
+        SELECT count(distinct mp.team_no)::int as c
+        FROM match_confirmations mc
+        JOIN match_participants mp ON mp.match_id=mc.match_id AND mp.user_id=mc.user_id
+        WHERE mc.match_id=:m AND mc.status='confirmed'
+    """), {"m": match_id}).mappings().first()["c"]
 
     db.execute(sa.text("""
         UPDATE matches
         SET confirmed_count=:c
         WHERE id=:m
-    """), {"c": int(confirmed_count), "m": match_id})
+    """), {"m": match_id, "c": confirmed_count})
 
-    # Confirmación cruzada: mínimo 1 por cada equipo
-    teams_confirmed = db.execute(sa.text("""
-        SELECT count(DISTINCT mp.team_no)
-        FROM match_confirmations mc
-        JOIN match_participants mp
-          ON mp.match_id = mc.match_id
-         AND mp.user_id  = mc.user_id
-        WHERE mc.match_id=:m
-          AND mc.status='confirmed'
-    """), {"m": match_id}).scalar_one()
+    if teams_confirmed >= 2:
+        prop = db.execute(sa.text("""
+            SELECT proposed_score_json, proposed_winner_team_no
+            FROM matches
+            WHERE id=:m
+        """), {"m": match_id}).mappings().first()
 
-    # Si ya hay confirmación cruzada, verificar y aplicar ranking
-    m2 = db.execute(sa.text("""
-        SELECT status
-        FROM matches
-        WHERE id=:m
-    """), {"m": match_id}).mappings().first()
+        if prop and prop["proposed_score_json"] is not None:
+            db.execute(sa.text("""
+                UPDATE match_scores
+                SET score_json=CAST(:s AS jsonb), winner_team_no=:w
+                WHERE match_id=:m
+            """), {"m": match_id, "s": json.dumps(prop["proposed_score_json"]), "w": int(prop["proposed_winner_team_no"])})
 
-    if int(teams_confirmed) >= 2 and m2["status"] != "verified":
+            db.execute(sa.text("""
+                UPDATE matches
+                SET proposed_score_json=NULL,
+                    proposed_winner_team_no=NULL,
+                    proposed_by=NULL,
+                    proposed_at=NULL
+                WHERE id=:m
+            """), {"m": match_id})
+
         db.execute(sa.text("""
             UPDATE matches
             SET status='verified'
             WHERE id=:m
         """), {"m": match_id})
 
-        audit(db, None, "match", match_id, "verified", {
-            "confirmed_count": int(confirmed_count),
-            "teams_confirmed": int(teams_confirmed),
-        })
-
         _apply_ranking_for_match(db, match_id)
 
-    audit(db, current.id, "confirmation", f"{match_id}:{current.id}", "confirmed", {})
     db.commit()
-    return {"ok": True, "confirmed_count": int(confirmed_count), "teams_confirmed": int(teams_confirmed)}
+    return ConfirmOut(ok=True, confirmed_count=confirmed_count, teams_confirmed=teams_confirmed)

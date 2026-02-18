@@ -4,7 +4,7 @@ import sqlalchemy as sa
 
 from app.api.deps import get_current_user
 from app.db.session import get_db
-from app.schemas.me import MeOut, ProfileOut, ProfileUpdateIn, LadderStateOut
+from app.schemas.me import MeOut, ProfileOut, ProfileUpdateIn, LadderStateOut, PlayEligibilityOut
 from app.services.audit import audit
 
 from app.schemas.match import MyMatchesOut, MyMatchRowOut
@@ -86,6 +86,66 @@ def me(current=Depends(get_current_user), db: Session = Depends(get_db)):
         status=current.status,
         profile=profile,
     )
+
+def _is_placeholder_alias(alias: str | None) -> bool:
+    return (alias is None) or alias.startswith("player_")
+
+@router.get("/play-eligibility", response_model=PlayEligibilityOut)
+def play_eligibility(current=Depends(get_current_user), db: Session = Depends(get_db)):
+    prof = db.execute(sa.text("""
+        SELECT alias, gender
+        FROM user_profiles
+        WHERE user_id=:u
+    """), {"u": current.id}).mappings().first()
+
+    if not prof:
+        return PlayEligibilityOut(
+            can_play=False,
+            can_create_match=False,
+            can_be_invited=False,
+            missing=["perfil"],
+            message="Debes completar tu perfil para poder jugar."
+        )
+
+    missing: list[str] = []
+
+    alias = prof.get("alias")
+    gender = prof.get("gender")
+
+    if _is_placeholder_alias(alias):
+        missing.append("usuario")
+
+    if gender not in ("M", "F"):
+        missing.append("género")
+
+    required_ladders: list[str] = []
+    if gender == "M":
+        required_ladders = ["HM", "MX"]
+    elif gender == "F":
+        required_ladders = ["WM", "MX"]
+
+    if required_ladders:
+        stmt = sa.text("""
+            SELECT ladder_code
+            FROM user_ladder_state
+            WHERE user_id=:u AND ladder_code = ANY(:ladders)
+        """)
+        # psycopg soporta arrays; si te da problema, te dejo alternativa más abajo.
+        rows = db.execute(stmt, {"u": str(current.id), "ladders": required_ladders}).mappings().all()
+        have = {r["ladder_code"] for r in rows}
+        if any(l not in have for l in required_ladders):
+            missing.append("categoría")
+
+    can_play = (len(missing) == 0)
+    msg = None if can_play else "Completa tu perfil (usuario, género y categoría) para crear o participar en partidos."
+
+    return PlayEligibilityOut(
+        can_play=can_play,
+        can_create_match=can_play,
+        can_be_invited=can_play,
+        missing=missing,
+        message=msg
+    )
     
 @router.patch("/profile", response_model=MeOut)
 def update_profile(payload: ProfileUpdateIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
@@ -137,6 +197,9 @@ def update_profile(payload: ProfileUpdateIn, current=Depends(get_current_user), 
 
     gender_eff = payload.gender if payload.gender is not None else prof["gender"]
 
+    if payload.primary_category_code is not None and gender_eff not in ("M", "F"):
+        raise HTTPException(400, "Debes definir tu género (M o F) antes de elegir categoría.")
+    
     if payload.primary_category_code is not None:
         primary_ladder = "HM" if gender_eff == "M" else "WM"
 
@@ -147,7 +210,6 @@ def update_profile(payload: ProfileUpdateIn, current=Depends(get_current_user), 
         mx_cat_id = _get_category_id_by_code(db, "MX", mx_code)
         _upsert_ladder_state(db, current.id, "MX", mx_cat_id)
 
-    # 6) audit + commit
     audit(db, current.id, "profile", str(current.id), "updated", {
         "alias": payload.alias,
         "gender": payload.gender,

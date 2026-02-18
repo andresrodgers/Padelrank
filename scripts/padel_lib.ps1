@@ -13,6 +13,11 @@ function Set-Base([string]$base) {
   $script:BASE = $base.TrimEnd("/")
 }
 
+function New-UserAndProfileUnique($phone, $baseAlias, $gender, $cat) {
+  $suffix = $phone.Substring($phone.Length - 4)
+  New-UserAndProfile $phone "${baseAlias}_$suffix" $gender $cat
+}
+
 function Get-Base() { return $script:BASE }
 
 function Assert-JWT([string]$token) {

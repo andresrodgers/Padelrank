@@ -8,75 +8,123 @@ class ParticipantIn(BaseModel):
     team_no: int = Field(..., ge=1, le=2)
 
 class MatchScoreIn(BaseModel):
-    score_json: dict
-    winner_team_no: int | None = Field(None, ge=1, le=2)
+    score_json: Dict[str, Any]
+    winner_team_no: Optional[int] = Field(None, ge=1, le=2)
 
     @field_validator("score_json")
     @classmethod
-    def validate_score_json(cls, v: dict) -> dict:
-        if not isinstance(v, dict) or "sets" not in v:
-            raise ValueError("score_json must contain 'sets'")
+    def validate_score_json(cls, v):
+        if not isinstance(v, dict):
+            raise ValueError("score_json must be an object")
+        sets = v.get("sets", [])
+        if not (2 <= len(sets) <= 3):
+            raise ValueError("score_json.sets must have 2 or 3 sets")
 
-        sets = v.get("sets")
-        if not isinstance(sets, list) or len(sets) not in (2, 3):
-            raise ValueError("Match must have 2 or 3 sets")
+        t1_wins = 0
+        t2_wins = 0
 
-        def valid_set(a: int, b: int) -> bool:
-            # basic bounds
-            if not (0 <= a <= 7 and 0 <= b <= 7):
-                return False
-            if a == b:
-                return False
-
-            hi = max(a, b)
-            lo = min(a, b)
-
-            # Allowed set endings in padel
-            # 6-x where x <= 4
-            if hi == 6 and lo <= 4:
-                return True
-            # 7-5
-            if hi == 7 and lo == 5:
-                return True
-            # 7-6 (tiebreak)
-            if hi == 7 and lo == 6:
-                return True
-
-            return False
-
-        t1_sets = 0
-        t2_sets = 0
-
-        for i, s in enumerate(sets, start=1):
-            if not isinstance(s, dict) or "t1" not in s or "t2" not in s:
-                raise ValueError(f"Set {i} must be an object with t1 and t2")
-
-            t1 = s["t1"]
-            t2 = s["t2"]
+        for s in sets:
+            if not isinstance(s, dict):
+                raise ValueError("each set must be an object")
+            t1 = s.get("t1")
+            t2 = s.get("t2")
             if not (isinstance(t1, int) and isinstance(t2, int)):
-                raise ValueError(f"Set {i} values must be integers")
+                raise ValueError("set scores must be ints")
+            if not (0 <= t1 <= 7 and 0 <= t2 <= 7):
+                raise ValueError("set scores must be between 0 and 7")
+            if t1 == t2:
+                raise ValueError("set cannot be tied")
 
-            if not valid_set(t1, t2):
-                raise ValueError(f"Invalid set score at set {i}: {t1}-{t2}")
+            mx = max(t1, t2)
+            mn = min(t1, t2)
+            if mx not in (6, 7):
+                raise ValueError("set must end at 6 or 7")
+            if mx == 6 and mn > 4:
+                raise ValueError("6-x must be 6-0..6-4")
+            if mx == 7 and mn not in (5, 6):
+                raise ValueError("7-x must be 7-5 or 7-6")
 
             if t1 > t2:
-                t1_sets += 1
+                t1_wins += 1
             else:
-                t2_sets += 1
+                t2_wins += 1
 
-        # Must be best-of-3: winner has exactly 2 sets
-        if not ((t1_sets == 2 and t2_sets in (0, 1)) or (t2_sets == 2 and t1_sets in (0, 1))):
-            raise ValueError("Match must end when one team wins 2 sets (best of 3)")
-
-        # If 3 sets, first two must be split 1-1
-        if len(sets) == 3:
-            first_two = sets[:2]
-            ft1 = sum(1 for s in first_two if s["t1"] > s["t2"])
-            ft2 = 2 - ft1
-            if not (ft1 == 1 and ft2 == 1):
-                raise ValueError("If there are 3 sets, the first two sets must be split 1-1")
+        # coherencia best-of-3
+        if len(sets) == 2:
+            if t1_wins == 1 and t2_wins == 1:
+                raise ValueError("if 2 sets, winner must win 2-0 (no 1-1)")
+        else:  # 3 sets
+            if not ((t1_wins, t2_wins) in [(2, 1), (1, 2)]):
+                raise ValueError("if 3 sets, must end 2-1")
+            first2 = sets[:2]
+            a = sum(1 for s in first2 if s["t1"] > s["t2"])
+            b = 2 - a
+            if not (a == 1 and b == 1):
+                raise ValueError("third set only allowed when first two sets are split 1-1")
 
         return v
+
+    def derived_winner(self) -> int:
+        sets = self.score_json["sets"]
+        t1_sets = sum(1 for s in sets if s["t1"] > s["t2"])
+        t2_sets = len(sets) - t1_sets
+        return 1 if t1_sets > t2_sets else 2
+
+@field_validator("score_json")
+@classmethod
+def validate_score_json(cls, v):
+    if not isinstance(v, dict):
+        raise ValueError("score_json must be an object")
+    sets = v.get("sets", [])
+    if not (2 <= len(sets) <= 3):
+        raise ValueError("score_json.sets must have 2 or 3 sets")
+
+    t1_wins = 0
+    t2_wins = 0
+
+    for s in sets:
+        if not isinstance(s, dict):
+            raise ValueError("each set must be an object")
+        t1 = s.get("t1")
+        t2 = s.get("t2")
+        if not (isinstance(t1, int) and isinstance(t2, int)):
+            raise ValueError("set scores must be ints")
+        if not (0 <= t1 <= 7 and 0 <= t2 <= 7):
+            raise ValueError("set scores must be between 0 and 7")
+        if t1 == t2:
+            raise ValueError("set cannot be tied")
+
+        mx = max(t1, t2)
+        mn = min(t1, t2)
+        if mx not in (6, 7):
+            raise ValueError("set must end at 6 or 7")
+        if mx == 6 and mn > 4:
+            raise ValueError("6-x must be 6-0..6-4")
+        if mx == 7 and mn not in (5, 6):
+            raise ValueError("7-x must be 7-5 or 7-6")
+
+        if t1 > t2:
+            t1_wins += 1
+        else:
+            t2_wins += 1
+
+    # coherencia best-of-3
+    if len(sets) == 2:
+        if t1_wins == 1 and t2_wins == 1:
+            raise ValueError("if 2 sets, winner must win 2-0 (no 1-1)")
+    else:  # 3 sets
+        # debe ser 2-1
+        if not ((t1_wins, t2_wins) in [(2, 1), (1, 2)]):
+            raise ValueError("if 3 sets, must end 2-1")
+        # y el 3er set solo existe si iban 1-1 en los dos primeros
+        first2 = sets[:2]
+        a = sum(1 for s in first2 if s["t1"] > s["t2"])
+        b = 2 - a
+        if not (a == 1 and b == 1):
+            raise ValueError("third set only allowed when first two sets are split 1-1")
+
+    return v
+
 
     def derived_winner(self) -> int:
         sets = self.score_json["sets"]
@@ -108,8 +156,12 @@ class ConfirmIn(BaseModel):
     note: Optional[str] = None
     source: Optional[str] = None
 
-    # Si viene, significa "proponer corrección" (o confirmar ese score)
     score_json: Optional[Dict[str, Any]] = None
+    
+class ConfirmOut(BaseModel):
+    ok: bool = True
+    confirmed_count: int = 0
+    teams_confirmed: int = 0
     
 class MyMatchRowOut(BaseModel):
     id: str

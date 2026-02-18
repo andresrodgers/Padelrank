@@ -1,4 +1,5 @@
 from pydantic import BaseModel
+from typing import List, Optional
 
 class ProfileOut(BaseModel):
     alias: str
@@ -15,10 +16,6 @@ class ProfileUpdateIn(BaseModel):
     alias: str | None = None
     gender: str | None = None
     is_public: bool | None = None
-
-    # Categoría predefinida seleccionada en onboarding:
-    # M -> HM: 1ra..7ma
-    # F -> WM: A..D
     primary_category_code: str | None = None
 
 class LadderStateOut(BaseModel):
@@ -30,3 +27,10 @@ class LadderStateOut(BaseModel):
     verified_matches: int
     is_provisional: bool
     trust_score: int
+
+class PlayEligibilityOut(BaseModel):
+    can_play: bool
+    can_create_match: bool
+    can_be_invited: bool
+    missing: List[str]
+    message: Optional[str] = None
