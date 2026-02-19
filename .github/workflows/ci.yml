@@ -8,9 +8,28 @@ on:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: padel_mvp
+          POSTGRES_USER: padel
+          POSTGRES_PASSWORD: padel
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U padel -d padel_mvp"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
     defaults:
       run:
         working-directory: backend
+    env:
+      DATABASE_URL: postgresql+psycopg://padel:padel@localhost:5432/padel_mvp
+      JWT_SECRET: ci_dummy_secret
+      OTP_PEPPER: ci_dummy_pepper
+      OTP_REQUEST_COOLDOWN_SECONDS: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -23,10 +42,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run migrations
+        run: |
+          alembic upgrade head
 
       - name: Import check
-        env:
-          DATABASE_URL: postgresql+psycopg://padel:padel@localhost:5432/padel_mvp
-          JWT_SECRET: ci_dummy_secret
-        run: |
-          python -c "import app; import app.main"
+        run: python -c "import app; import app.main"
+
+      - name: Run tests
+        run: pytest -q

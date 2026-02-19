@@ -1,4 +1,3 @@
-@"
 # --- Python ---
 __pycache__/
 *.py[cod]
@@ -32,13 +31,14 @@ Thumbs.db
 .vscode/
 .idea/
 
-# --- Docker ---
+# --- Docker / env files ---
 **/.env
+.env
 .env.*
+!.env.example
 
 # --- Local data / temp ---
 *.sqlite3
 *.db
 tmp/
 temp/
-"@ | Set-Content -Encoding UTF8 .gitignore

@@ -49,15 +49,30 @@ function Invoke-Api {
 }
 
 function Get-Token([string]$phone) {
-  # /auth/otp/request -> devuelve dev_code en ENV=dev
-  $r = Invoke-Api -Method Post -Path "/auth/otp/request" -Body @{ phone_e164 = $phone }
-  $code = $r.dev_code
-  if (-not $code) { throw "No llegó dev_code. Revisa ENV=dev" }
+  $pwd = "P@del_" + $phone.Substring($phone.Length - 4)
 
-  $v = Invoke-Api -Method Post -Path "/auth/otp/verify" -Body @{ phone_e164 = $phone; code = $code }
-  $token = ($v.access_token).Trim()
-  Assert-JWT $token
-  return $token
+  $r = Invoke-Api -Method Post -Path "/auth/otp/request" -Body @{ phone_e164 = $phone; purpose = "register" }
+  $code = $r.dev_code
+  if (-not $code) { throw "No llego dev_code. Revisa ENV=dev" }
+
+  try {
+    $v = Invoke-Api -Method Post -Path "/auth/register/complete" -Body @{
+      phone_e164 = $phone
+      code = $code
+      password = $pwd
+    }
+    $token = ($v.access_token).Trim()
+    Assert-JWT $token
+    return $token
+  } catch {
+    $lg = Invoke-Api -Method Post -Path "/auth/login" -Body @{
+      identifier = $phone
+      password = $pwd
+    }
+    $token = ($lg.access_token).Trim()
+    Assert-JWT $token
+    return $token
+  }
 }
 
 function Get-Me([string]$token) {

@@ -1,15 +1,83 @@
+from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 import sqlalchemy as sa
 
 from app.api.deps import get_current_user
+from app.core.config import settings
+from app.core.security import now_utc, otp_hash, pii_hash, random_otp_code
 from app.db.session import get_db
-from app.schemas.me import MeOut, ProfileOut, ProfileUpdateIn, LadderStateOut, PlayEligibilityOut
+from app.schemas.me import (
+    MeOut,
+    ProfileOut,
+    ProfileUpdateIn,
+    LadderStateOut,
+    PlayEligibilityOut,
+    ContactChangeRequestIn,
+    ContactChangeRequestOut,
+    ContactChangeConfirmIn,
+    ContactChangeConfirmOut,
+)
 from app.services.audit import audit
 
 from app.schemas.match import MyMatchesOut, MyMatchRowOut
 
 router = APIRouter()
+
+def _normalize_phone(phone_e164: str | None, country_code: str | None, phone_number: str | None) -> str:
+    if phone_e164:
+        raw = phone_e164.strip()
+        if not raw.startswith("+"):
+            raw = "+" + raw
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if not digits:
+            raise HTTPException(400, "Invalid phone")
+        return "+" + digits
+
+    cc = (country_code or "").strip().replace("+", "")
+    nsn = "".join(ch for ch in (phone_number or "").strip() if ch.isdigit())
+    if not cc or not nsn:
+        raise HTTPException(400, "country_code and phone_number are required")
+    return f"+{cc}{nsn}"
+
+def _normalize_email(email: str | None) -> str:
+    raw = (email or "").strip().lower()
+    if not raw or "@" not in raw or "." not in raw.split("@")[-1]:
+        raise HTTPException(400, "Invalid email")
+    return raw
+
+def _resolve_contact(phone_e164: str | None, country_code: str | None, phone_number: str | None, email: str | None) -> tuple[str, str]:
+    if email:
+        return ("email", _normalize_email(email))
+    return ("phone", _normalize_phone(phone_e164, country_code, phone_number))
+
+def _identity_in_use_by_other(db: Session, user_id: str, contact_kind: str, contact_value: str) -> bool:
+    row = db.execute(sa.text("""
+        SELECT 1
+        FROM auth_identities
+        WHERE kind=:k AND value=:v AND user_id<>:u
+        LIMIT 1
+    """), {"k": contact_kind, "v": contact_value, "u": user_id}).first()
+    return bool(row)
+
+def _upsert_verified_identity(db: Session, user_id: str, contact_kind: str, contact_value: str):
+    current = db.execute(sa.text("""
+        SELECT id
+        FROM auth_identities
+        WHERE user_id=:u AND kind=:k
+        FOR UPDATE
+    """), {"u": user_id, "k": contact_kind}).mappings().first()
+    if current:
+        db.execute(sa.text("""
+            UPDATE auth_identities
+            SET value=:v, is_verified=true, verified_at=now()
+            WHERE id=:id
+        """), {"id": current["id"], "v": contact_value})
+        return
+    db.execute(sa.text("""
+        INSERT INTO auth_identities (user_id, kind, value, is_verified, verified_at)
+        VALUES (:u, :k, :v, true, now())
+    """), {"u": user_id, "k": contact_kind, "v": contact_value})
 
 def _sum_verified_matches(db: Session, user_id) -> int:
     return int(db.execute(sa.text("""
@@ -38,6 +106,20 @@ def _get_mx_code_from_map(db: Session, gender: str, primary_code: str) -> str:
         raise HTTPException(400, "MX mapping missing for gender/category")
     return row["mx_code"]
 
+def _count_user_matches(db: Session, user_id, ladder_code: str | None = None) -> int:
+    if ladder_code is None:
+        return int(db.execute(sa.text("""
+            SELECT count(*)
+            FROM match_participants
+            WHERE user_id=:u
+        """), {"u": user_id}).scalar_one())
+    return int(db.execute(sa.text("""
+        SELECT count(*)
+        FROM match_participants mp
+        JOIN matches m ON m.id = mp.match_id
+        WHERE mp.user_id=:u AND m.ladder_code=:l
+    """), {"u": user_id, "l": ladder_code}).scalar_one())
+
 def _upsert_ladder_state(db: Session, user_id, ladder_code: str, category_id: str):
     existing = db.execute(sa.text("""
         SELECT verified_matches, category_id::text AS category_id
@@ -49,15 +131,17 @@ def _upsert_ladder_state(db: Session, user_id, ladder_code: str, category_id: st
         vm = int(existing["verified_matches"])
         current_cat = existing["category_id"]
 
-        # Idempotencia: si mandan la misma categoría, OK sin tocar nada
+        # Idempotencia: si mandan la misma categorÃ­a, OK sin tocar nada
         if current_cat == str(category_id):
             return
 
         # Si ya hay verificados, NO se permite cambiar
         if vm > 0:
             raise HTTPException(400, f"Cannot change category for ladder {ladder_code} after verified matches")
+        if _count_user_matches(db, user_id, ladder_code) > 0:
+            raise HTTPException(400, f"Cannot change category for ladder {ladder_code} after any match participation")
 
-        # vm == 0: se permite corrección
+        # vm == 0: se permite correcciÃ³n
         db.execute(sa.text("""
             UPDATE user_ladder_state
             SET category_id=:c, updated_at=now()
@@ -65,7 +149,7 @@ def _upsert_ladder_state(db: Session, user_id, ladder_code: str, category_id: st
         """), {"u": user_id, "l": ladder_code, "c": category_id})
         return
 
-    # No existe aún: crear
+    # No existe aÃºn: crear
     db.execute(sa.text("""
         INSERT INTO user_ladder_state (user_id, ladder_code, category_id, rating, verified_matches, is_provisional, trust_score)
         VALUES (:u, :l, :c, 1000, 0, true, 100)
@@ -74,7 +158,7 @@ def _upsert_ladder_state(db: Session, user_id, ladder_code: str, category_id: st
 @router.get("", response_model=MeOut)
 def me(current=Depends(get_current_user), db: Session = Depends(get_db)):
     prof = db.execute(sa.text("""
-        SELECT alias, gender, is_public
+        SELECT alias, gender, is_public, country, city, handedness, preferred_side, birthdate, first_name, last_name
         FROM user_profiles
         WHERE user_id=:u
     """), {"u": current.id}).mappings().first()
@@ -83,12 +167,158 @@ def me(current=Depends(get_current_user), db: Session = Depends(get_db)):
     return MeOut(
         id=str(current.id),
         phone_e164=current.phone_e164,
+        email=current.email,
         status=current.status,
         profile=profile,
     )
 
-def _is_placeholder_alias(alias: str | None) -> bool:
-    return (alias is None) or alias.startswith("player_")
+@router.post("/contact-change/request", response_model=ContactChangeRequestOut)
+def request_contact_change(payload: ContactChangeRequestIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
+    contact_kind, contact_value = _resolve_contact(
+        payload.phone_e164,
+        payload.country_code,
+        payload.phone_number,
+        payload.email,
+    )
+
+    if contact_kind == "phone":
+        if current.phone_e164 == contact_value:
+            raise HTTPException(400, "Phone is already set")
+        exists = db.execute(
+            sa.text("SELECT 1 FROM users WHERE phone_e164=:v AND id<>:u"),
+            {"v": contact_value, "u": current.id},
+        ).first()
+    else:
+        if (current.email or "").lower() == contact_value:
+            raise HTTPException(400, "Email is already set")
+        exists = db.execute(
+            sa.text("SELECT 1 FROM users WHERE lower(email)=lower(:v) AND id<>:u"),
+            {"v": contact_value, "u": current.id},
+        ).first()
+
+    if exists or _identity_in_use_by_other(db, str(current.id), contact_kind, contact_value):
+        raise HTTPException(409, "Contact already in use")
+
+    last_row = db.execute(sa.text("""
+        SELECT created_at
+        FROM user_contact_changes
+        WHERE user_id=:u AND contact_kind=:k
+        ORDER BY created_at DESC
+        LIMIT 1
+    """), {"u": current.id, "k": contact_kind}).mappings().first()
+    if last_row:
+        cooldown_until = last_row["created_at"] + timedelta(seconds=settings.OTP_REQUEST_COOLDOWN_SECONDS)
+        if now_utc() < cooldown_until:
+            raise HTTPException(429, "Debes esperar 2 minutos antes de solicitar un nuevo codigo.")
+
+    code = random_otp_code()
+    code_h = otp_hash(code)
+    expires_at = now_utc() + timedelta(minutes=settings.OTP_TTL_MINUTES)
+
+    db.execute(sa.text("""
+        INSERT INTO user_contact_changes (user_id, contact_kind, new_contact_value, code_hash, expires_at, attempts)
+        VALUES (:u, :k, :v, :h, :e, 0)
+    """), {"u": current.id, "k": contact_kind, "v": contact_value, "h": code_h, "e": expires_at})
+
+    audit(
+        db,
+        current.id,
+        "user_contact",
+        str(current.id),
+        "change_requested",
+        {"contact_kind": contact_kind, "contact_hash": pii_hash(contact_value, contact_kind)},
+    )
+    db.commit()
+
+    out = ContactChangeRequestOut(ok=True, contact_kind=contact_kind)
+    if settings.ENV == "dev":
+        out.dev_code = code
+    return out
+
+@router.post("/contact-change/confirm", response_model=ContactChangeConfirmOut)
+def confirm_contact_change(payload: ContactChangeConfirmIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
+    row = db.execute(sa.text("""
+        SELECT id, contact_kind, new_contact_value, code_hash, expires_at, attempts, consumed_at
+        FROM user_contact_changes
+        WHERE user_id=:u AND contact_kind=:k
+        ORDER BY created_at DESC
+        LIMIT 1
+        FOR UPDATE
+    """), {"u": current.id, "k": payload.contact_kind}).mappings().first()
+
+    if not row:
+        raise HTTPException(400, "Contact change request not found")
+    if row["consumed_at"] is not None:
+        raise HTTPException(400, "Contact change request already used")
+    if now_utc() > row["expires_at"]:
+        raise HTTPException(400, "Contact change request expired")
+    if row["attempts"] >= 5:
+        raise HTTPException(400, "Too many attempts")
+    if otp_hash(payload.code) != row["code_hash"]:
+        db.execute(sa.text("""
+            UPDATE user_contact_changes
+            SET attempts=attempts+1
+            WHERE id=:id
+        """), {"id": row["id"]})
+        db.commit()
+        raise HTTPException(400, "Invalid OTP")
+
+    if payload.contact_kind == "phone":
+        exists = db.execute(sa.text("""
+            SELECT 1
+            FROM users
+            WHERE phone_e164=:v AND id<>:u
+        """), {"v": row["new_contact_value"], "u": current.id}).first()
+        if exists or _identity_in_use_by_other(db, str(current.id), "phone", row["new_contact_value"]):
+            raise HTTPException(409, "Phone already in use")
+        db.execute(sa.text("""
+            UPDATE users
+            SET phone_e164=:v
+            WHERE id=:u
+        """), {"v": row["new_contact_value"], "u": current.id})
+        _upsert_verified_identity(db, str(current.id), "phone", row["new_contact_value"])
+    else:
+        exists = db.execute(sa.text("""
+            SELECT 1
+            FROM users
+            WHERE lower(email)=lower(:v) AND id<>:u
+        """), {"v": row["new_contact_value"], "u": current.id}).first()
+        if exists or _identity_in_use_by_other(db, str(current.id), "email", row["new_contact_value"]):
+            raise HTTPException(409, "Email already in use")
+        db.execute(sa.text("""
+            UPDATE users
+            SET email=:v
+            WHERE id=:u
+        """), {"v": row["new_contact_value"], "u": current.id})
+        _upsert_verified_identity(db, str(current.id), "email", row["new_contact_value"])
+
+    db.execute(sa.text("""
+        UPDATE user_contact_changes
+        SET consumed_at=now()
+        WHERE id=:id
+    """), {"id": row["id"]})
+
+    audit(
+        db,
+        current.id,
+        "user_contact",
+        str(current.id),
+        "change_confirmed",
+        {"contact_kind": payload.contact_kind},
+    )
+    db.commit()
+
+    refreshed = db.execute(sa.text("""
+        SELECT phone_e164, email
+        FROM users
+        WHERE id=:u
+    """), {"u": current.id}).mappings().first()
+    return ContactChangeConfirmOut(
+        ok=True,
+        contact_kind=payload.contact_kind,
+        phone_e164=refreshed["phone_e164"],
+        email=refreshed["email"],
+    )
 
 @router.get("/play-eligibility", response_model=PlayEligibilityOut)
 def play_eligibility(current=Depends(get_current_user), db: Session = Depends(get_db)):
@@ -104,73 +334,86 @@ def play_eligibility(current=Depends(get_current_user), db: Session = Depends(ge
             can_create_match=False,
             can_be_invited=False,
             missing=["perfil"],
-            message="Debes completar tu perfil para poder jugar."
+            message="Debes completar tu perfil para poder jugar.",
         )
 
     missing: list[str] = []
 
+    has_verified_contact = bool(db.execute(sa.text("""
+        SELECT 1
+        FROM auth_identities
+        WHERE user_id=:u AND is_verified=true
+        LIMIT 1
+    """), {"u": current.id}).first())
+    if not has_verified_contact:
+        missing.append("canal_verificado")
+
     alias = prof.get("alias")
     gender = prof.get("gender")
 
-    if _is_placeholder_alias(alias):
+    if alias is None or not alias.strip():
         missing.append("usuario")
 
     if gender not in ("M", "F"):
-        missing.append("género")
+        missing.append("genero")
 
-    required_ladders: list[str] = []
-    if gender == "M":
-        required_ladders = ["HM", "MX"]
-    elif gender == "F":
-        required_ladders = ["WM", "MX"]
+    preferred_ladder = {"M": "HM", "F": "WM"}.get(gender)
+    ladders_to_check: list[str] = []
+    if preferred_ladder:
+        ladders_to_check.append(preferred_ladder)
+        if preferred_ladder != "MX":
+            ladders_to_check.append("MX")
 
-    if required_ladders:
-        stmt = sa.text("""
+    if ladders_to_check:
+        rows = db.execute(sa.text("""
             SELECT ladder_code
             FROM user_ladder_state
             WHERE user_id=:u AND ladder_code = ANY(:ladders)
-        """)
-        # psycopg soporta arrays; si te da problema, te dejo alternativa más abajo.
-        rows = db.execute(stmt, {"u": str(current.id), "ladders": required_ladders}).mappings().all()
+        """), {"u": str(current.id), "ladders": ladders_to_check}).mappings().all()
         have = {r["ladder_code"] for r in rows}
-        if any(l not in have for l in required_ladders):
-            missing.append("categoría")
+        if not any(ladder in have for ladder in ladders_to_check):
+            missing.append("categoria")
 
-    can_play = (len(missing) == 0)
-    msg = None if can_play else "Completa tu perfil (usuario, género y categoría) para crear o participar en partidos."
+    can_play = len(missing) == 0
+    msg = None if can_play else "Completa tu perfil (canal verificado, usuario, genero y categoria) para crear o participar en partidos."
 
     return PlayEligibilityOut(
         can_play=can_play,
         can_create_match=can_play,
         can_be_invited=can_play,
         missing=missing,
-        message=msg
+        message=msg,
     )
-    
+
 @router.patch("/profile", response_model=MeOut)
 def update_profile(payload: ProfileUpdateIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
     # 1) leer perfil actual
     prof = db.execute(sa.text("""
-        SELECT alias, gender, is_public
+        SELECT alias, gender, is_public, country, city, handedness, preferred_side, birthdate, first_name, last_name
         FROM user_profiles
         WHERE user_id=:u
     """), {"u": current.id}).mappings().first()
     if not prof:
         raise HTTPException(400, "Profile missing")
 
-    # 2) alias único si se cambia
+    # 2) alias Ãºnico si se cambia
     if payload.alias:
         exists = db.execute(sa.text("""
             SELECT 1
             FROM user_profiles
-            WHERE alias=:a AND user_id<>:u
+            WHERE lower(alias)=lower(:a) AND user_id<>:u
         """), {"a": payload.alias, "u": current.id}).first()
         if exists:
             raise HTTPException(400, "Alias already taken")
 
-    # 3) gender válido
+    # 3) gender vÃ¡lido
     if payload.gender is not None and payload.gender not in ("M", "F"):
         raise HTTPException(400, "Gender must be M or F")
+    if payload.gender is not None and payload.gender != prof["gender"]:
+        if _count_user_matches(db, current.id) > 0:
+            raise HTTPException(400, "Cannot change gender after match participation")
+        if prof["gender"] in ("M", "F"):
+            raise HTTPException(400, "Gender cannot be modified once defined")
 
     # 4) update en user_profiles (solo lo que venga)
     updates = []
@@ -188,6 +431,40 @@ def update_profile(payload: ProfileUpdateIn, current=Depends(get_current_user), 
         updates.append("is_public=:is_public")
         params["is_public"] = payload.is_public
 
+    if payload.country is not None:
+        country = payload.country.strip().upper()
+        if len(country) != 2:
+            raise HTTPException(400, "country must be ISO-2 (e.g. CO)")
+        updates.append("country=:country")
+        params["country"] = country
+
+    if payload.city is not None:
+        city = payload.city.strip() if payload.city else None
+        updates.append("city=:city")
+        params["city"] = city
+
+    if payload.handedness is not None:
+        updates.append("handedness=:handedness")
+        params["handedness"] = payload.handedness
+
+    if payload.preferred_side is not None:
+        updates.append("preferred_side=:preferred_side")
+        params["preferred_side"] = payload.preferred_side
+
+    if payload.birthdate is not None:
+        updates.append("birthdate=:birthdate")
+        params["birthdate"] = payload.birthdate
+
+    if payload.first_name is not None:
+        first_name = payload.first_name.strip() if payload.first_name else None
+        updates.append("first_name=:first_name")
+        params["first_name"] = first_name
+
+    if payload.last_name is not None:
+        last_name = payload.last_name.strip() if payload.last_name else None
+        updates.append("last_name=:last_name")
+        params["last_name"] = last_name
+
     if updates:
         db.execute(sa.text(f"""
             UPDATE user_profiles
@@ -198,7 +475,7 @@ def update_profile(payload: ProfileUpdateIn, current=Depends(get_current_user), 
     gender_eff = payload.gender if payload.gender is not None else prof["gender"]
 
     if payload.primary_category_code is not None and gender_eff not in ("M", "F"):
-        raise HTTPException(400, "Debes definir tu género (M o F) antes de elegir categoría.")
+        raise HTTPException(400, "Debes definir tu gÃ©nero (M o F) antes de elegir categorÃ­a.")
     
     if payload.primary_category_code is not None:
         primary_ladder = "HM" if gender_eff == "M" else "WM"
@@ -215,6 +492,13 @@ def update_profile(payload: ProfileUpdateIn, current=Depends(get_current_user), 
         "gender": payload.gender,
         "is_public": payload.is_public,
         "primary_category_code": payload.primary_category_code,
+        "country": payload.country,
+        "city": payload.city,
+        "handedness": payload.handedness,
+        "preferred_side": payload.preferred_side,
+        "birthdate": str(payload.birthdate) if payload.birthdate else None,
+        "first_name": payload.first_name,
+        "last_name": payload.last_name,
     })
 
     db.commit()
@@ -290,3 +574,6 @@ def my_matches(
     out_rows = [MyMatchRowOut(**r) for r in rows]
     next_offset = (offset + limit) if len(out_rows) == limit else None
     return MyMatchesOut(rows=out_rows, limit=limit, offset=offset, next_offset=next_offset)
+
+
+

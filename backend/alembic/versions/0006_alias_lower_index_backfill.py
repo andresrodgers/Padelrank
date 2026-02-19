@@ -1,16 +1,18 @@
-"""unique alias lower
+"""add alias lower unique index backfill
 
-Revision ID: 76cbbd7ab342
-Revises: 0002_categories_real_and_mx_map
-Create Date: 2026-02-15 05:24:55.911819
-
+Revision ID: 0006_alias_lower_index_backfill
+Revises: 0005_allow_u_gender
+Create Date: 2026-02-19
 """
+
 from alembic import op
 
-revision = '76cbbd7ab342'
-down_revision = '0002_categories_real_and_mx_map'
+
+revision = "0006_alias_lower_index_backfill"
+down_revision = "0005_allow_u_gender"
 branch_labels = None
 depends_on = None
+
 
 def upgrade():
     op.execute("""
@@ -30,6 +32,7 @@ def upgrade():
         CREATE UNIQUE INDEX IF NOT EXISTS uq_user_profiles_alias_lower
         ON user_profiles (lower(alias));
     """)
+
 
 def downgrade():
     op.execute("DROP INDEX IF EXISTS uq_user_profiles_alias_lower;")

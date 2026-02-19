@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.security import now_utc
-from app.db.session import get_db, engine
+from app.db.session import get_db
 from app.services.audit import audit
 from app.services.elo import compute_elo
 
@@ -92,21 +92,12 @@ def _determine_ladder_from_genders(genders: list[str]) -> str:
         return "WM"
     if m == 2 and f == 2:
         return "MX"
-    raise HTTPException(400, "Combinación de géneros no válida. Utilice 4M (HM), 4F (WM) o 2M2F (MX).")
+    raise HTTPException(400, "CombinaciÃ³n de gÃ©neros no vÃ¡lida. Utilice 4M (HM), 4F (WM) o 2M2F (MX).")
 
-def _require_ladder_states(db: Session, ladder_code: str, participant_ids: list[UUID]):
-    cnt = int(db.execute(sa.text("""
-        SELECT count(*)
-        FROM user_ladder_state
-        WHERE ladder_code=:l AND user_id = ANY(:ids)
-    """), {"l": ladder_code, "ids": participant_ids}).scalar_one())
-    if cnt != 4:
-        raise HTTPException(400, f"Todos los participantes deben tener el estado de rango para {ladder_code}. Completa primero el perfil (categoría).")
-
-def _derive_match_category_id(db: Session, ladder_code: str, participants, participant_ids: list[UUID]) -> str:
+def _derive_match_category_id(db: Session, ladder_code: str, participant_ids: list[UUID]) -> str:
     """
-    C3.1: category_id del match = categoría mediana de los 4 participantes (por sort_order)
-    en el ladder del match (HM/WM/MX). Solo etiqueta para analítica.
+    C3.1: category_id del match = categorÃ­a mediana de los 4 participantes (por sort_order)
+    en el ladder del match (HM/WM/MX). Solo etiqueta para analÃ­tica.
     """
     rows = db.execute(sa.text("""
         SELECT c.sort_order
@@ -117,7 +108,7 @@ def _derive_match_category_id(db: Session, ladder_code: str, participants, parti
     """), {"l": ladder_code, "ids": participant_ids}).mappings().all()
 
     if len(rows) != 4:
-        raise HTTPException(400, "Falta el estado/categoría de la tabla para los participantes.")
+        raise HTTPException(400, "Falta el estado/categorÃ­a de la tabla para los participantes.")
 
     sort_orders = sorted(int(r["sort_order"]) for r in rows)
 
@@ -131,7 +122,7 @@ def _derive_match_category_id(db: Session, ladder_code: str, participants, parti
     """), {"l": ladder_code}).mappings().all()
 
     if not cats:
-        raise HTTPException(400, "No hay categorías para la tabla")
+        raise HTTPException(400, "No hay categorÃ­as para la tabla")
 
     best = min(
         cats,
@@ -149,11 +140,12 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
     try:
         participant_ids = [UUID(p.user_id) for p in payload.participants]
     except Exception:
-        raise HTTPException(400, "Formato de ID de participante inválido")
+        raise HTTPException(400, "Formato de ID de participante invÃ¡lido")
 
     if len(set(participant_ids)) != 4:
-        raise HTTPException(400, "Los participantes deben ser únicos.")
-
+        raise HTTPException(400, "Los participantes deben ser unicos.")
+    if UUID(str(current.id)) not in participant_ids:
+        raise HTTPException(403, "El creador del partido debe estar entre los 4 participantes.")
     t1 = [p for p in payload.participants if p.team_no == 1]
     t2 = [p for p in payload.participants if p.team_no == 2]
     if len(t1) != 2 or len(t2) != 2:
@@ -174,27 +166,38 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
             detail="No se puede crear/invitar a partidos: todos los jugadores deben tener perfil creado."
         )
 
-    def is_placeholder(alias: str | None) -> bool:
-        return (alias is None) or alias.startswith("player_")
-
     bad = set()
+    ids_bp = sa.bindparam("ids", expanding=True)
+
+    verified_rows = db.execute(
+        sa.text("""
+            SELECT user_id::text AS user_id
+            FROM auth_identities
+            WHERE is_verified=true
+              AND user_id::text IN :ids
+            GROUP BY user_id
+        """).bindparams(ids_bp),
+        {"ids": [str(x) for x in participant_ids]},
+    ).mappings().all()
+    verified_users = {UUID(r["user_id"]) for r in verified_rows}
+    if any(uid not in verified_users for uid in participant_ids):
+        bad.add("canal_verificado")
 
     for uid in participant_ids:
         p = profiles_by_id[uid]
-        if is_placeholder(p.get("alias")):
+        alias = p.get("alias")
+        if alias is None or not alias.strip():
             bad.add("usuario")
         if p.get("gender") not in ("M", "F"):
-            bad.add("género")
+            bad.add("genero")
 
-    if "género" in bad:
+    if "genero" in bad:
         raise HTTPException(
             status_code=403,
-            detail="No se puede crear/invitar a partidos: todos los jugadores deben completar su perfil (usuario, género y categoría)."
+            detail="No se puede crear/invitar a partidos: todos los jugadores deben completar su perfil minimo (canal verificado, usuario, genero y categoria)."
         )
 
     ladder_code = _determine_ladder_from_genders([profiles_by_id[uid]["gender"] for uid in participant_ids])
-
-    ids_bp = sa.bindparam("ids", expanding=True)
 
     rows = db.execute(
         sa.text("""
@@ -205,32 +208,19 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
         """).bindparams(ids_bp),
         {"ladder": ladder_code, "ids": [str(x) for x in participant_ids]},
     ).mappings().all()
-    
-    import logging
-    logger = logging.getLogger(__name__)
-
-    aliases_dbg = {
-        str(uid): {
-            "alias": profiles_by_id[uid].get("alias"),
-            "gender": profiles_by_id[uid].get("gender"),
-            "keys": list(profiles_by_id[uid].keys()),
-        }
-        for uid in participant_ids
-    }
-    logger.warning({"aliases_dbg": aliases_dbg, "ladder_code": ladder_code})
 
     has_state = {UUID(r["user_id"]) for r in rows}
     missing_category = [uid for uid in participant_ids if uid not in has_state]
     if missing_category:
-        bad.add("categoría")
+        bad.add("categoria")
 
     if bad:
         raise HTTPException(
             status_code=403,
-            detail="No se puede crear/invitar a partidos: todos los jugadores deben completar su perfil (usuario, género y categoría)."
+            detail="No se puede crear/invitar a partidos: todos los jugadores deben completar su perfil minimo (canal verificado, usuario, genero y categoria)."
         )
 
-    category_id = _derive_match_category_id(db, ladder_code, payload.participants, participant_ids)
+    category_id = _derive_match_category_id(db, ladder_code, participant_ids)
 
     deadline = now_utc() + timedelta(hours=settings.CONFIRM_WINDOW_HOURS)
 
@@ -264,8 +254,6 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
     """), {"m": match_id, "s": json.dumps(payload.score.score_json), "w": winner_team})
 
     creator_id = str(current.id)
-    participant_str_ids = {str(x) for x in participant_ids}
-    creator_is_participant = creator_id in participant_str_ids
 
     for uid in participant_ids:
         uid_str = str(uid)
@@ -284,7 +272,7 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
         UPDATE matches
         SET confirmed_count=:c
         WHERE id=:m
-    """), {"c": 1 if creator_is_participant else 0, "m": match_id})
+    """), {"c": 1, "m": match_id})
 
     audit(db, current.id, "match", str(match_id), "created", {
         "ladder_code": ladder_code,
@@ -304,7 +292,9 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
     return MatchOut(**row)
 
 @router.get("/{match_id}", response_model=MatchOut)
-def get_match(match_id: str, db: Session = Depends(get_db)):
+def get_match(match_id: str, current=Depends(get_current_user), db: Session = Depends(get_db)):
+    _assert_is_participant(db, match_id, str(current.id))
+
     row = db.execute(sa.text("""
         SELECT
             id::text as id,
@@ -620,7 +610,7 @@ def confirm_match(match_id: str, payload: ConfirmIn, current=Depends(get_current
     if m["status"] != "pending_confirm":
         raise HTTPException(
             status_code=409,
-            detail=f"El partido no está pendiente de confirmación (estado={m['status']})."
+            detail=f"El partido no estÃ¡ pendiente de confirmaciÃ³n (estado={m['status']})."
         )
 
 
@@ -638,7 +628,7 @@ def confirm_match(match_id: str, payload: ConfirmIn, current=Depends(get_current
         if int(m["proposal_count"] or 0) >= settings.MAX_SCORE_PROPOSALS:
             raise HTTPException(
                 status_code=409,
-                detail="Límite de apelaciones alcanzado (máximo 2)."
+                detail="LÃ­mite de apelaciones alcanzado (mÃ¡ximo 2)."
             )
 
         score_in = MatchScoreIn(score_json=payload.score_json)
@@ -744,3 +734,5 @@ def confirm_match(match_id: str, payload: ConfirmIn, current=Depends(get_current
 
     db.commit()
     return ConfirmOut(ok=True, confirmed_count=confirmed_count, teams_confirmed=teams_confirmed)
+
+

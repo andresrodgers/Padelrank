@@ -1,39 +1,123 @@
-# Padel Ranking MVP (Neiva) — FastAPI + Postgres + Alembic (P0)
+# Padel Ranking MVP (Neiva)
 
-## Qué incluye (P0)
-- FastAPI con endpoints base: Auth OTP, Perfil, Config, Matches (crear/confirmar), Rankings.
-- PostgreSQL con modelo P0 + seed de ladders, categorías (C1..C3) y 3 clubes (placeholders).
-- Alembic migration inicial (0001).
+Backend API para registro de partidos, confirmaciones y ranking de padel.
+
+## Stack
+- FastAPI
+- PostgreSQL 16
+- SQLAlchemy + Alembic
+- Docker Compose
 
 ## Requisitos
-- Docker + Docker Compose
+- Docker
+- Docker Compose
 
-## Arranque
-1) Levanta Postgres:
+## Configuracion
+1. Copia `.env.example` a `.env`.
+2. Define secretos reales fuera del repositorio:
+- `JWT_SECRET`
+- `OTP_PEPPER`
+
+`/.env` esta ignorado por git. No guardes secretos reales en commits.
+
+## Arranque (modo normal)
+1. Levantar servicios:
 ```bash
 docker compose up -d db
+docker compose up --build -d api
 ```
-
-2) Crea el esquema:
+2. Ejecutar migraciones:
 ```bash
 docker compose run --rm api alembic upgrade head
 ```
+3. API y docs:
+- API: `http://localhost:8000`
+- Docs: `http://localhost:8000/docs`
 
-3) Corre la API:
+## Arranque (modo desarrollo con autoreload)
+Usa el compose base + override dev:
 ```bash
-docker compose up --build api
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-API: http://localhost:8000  
-Docs: http://localhost:8000/docs
+## Reglas de negocio relevantes
+- Un partido se crea con exactamente 4 participantes.
+- El creador del partido debe estar entre esos 4 participantes.
+- Cada equipo debe tener 2 participantes (`team_no` 1 y 2).
+- Ladders permitidos por genero:
+- `HM`: 4M
+- `WM`: 4F
+- `MX`: 2M + 2F
+- El creador queda confirmado al crear el partido.
+- El partido se verifica cuando hay confirmaciones de ambos equipos.
+- Si vence la ventana de confirmacion y sigue pendiente, el partido expira.
+- Ningun jugador puede crear/ser invitado si no cumple perfil minimo:
+- canal verificado (`phone` o `email`),
+- `alias`,
+- `gender`,
+- `category` en ladder correspondiente (o base).
 
-> OTP en DEV: el endpoint `/auth/otp/request` devuelve el `dev_code` (solo si `ENV=dev`).
+## Diseno definitivo de auth (acceso app)
+- Identidades: `email` y/o `phone`.
+- OTP:
+- se usa para verificacion de registro y reset de password.
+- no se usa para login diario.
+- Login diario: `identifier (email|phone) + password`.
+- Tokens: `access_token` corto + `refresh_token`.
+- Refresh token rotativo:
+- cada refresh invalida el anterior.
+- en DB se guarda solo hash del refresh (`auth_sessions.refresh_hash`).
+- Logout: revoca sesion de refresh actual.
+- Password: hash con `bcrypt`.
+- Rate limit base:
+- OTP con cooldown de 2 minutos por contacto.
+- login con contador por `login_key_hash` en ventana de 15 minutos.
 
-## Variables de entorno
-Están en `docker-compose.yml` (puedes moverlas a un `.env` luego).
+## Entidades de auth en DB
+- `users`
+- `auth_identities`
+- `auth_credentials`
+- `auth_sessions`
 
-## Notas rápidas de MVP
-- Match rankeable: 3/4 confirman antes de 48h y sin disputa.
-- Disputa: no afecta ranking.
-- Provisional: <5 verificados (cap de delta).
-- Ladders: HM/WM/MX. En MX exige 2M+2F.
+## Cambio de contacto (verificacion obligatoria)
+- `POST /me/contact-change/request`
+  - genera OTP para nuevo `email` o `telefono`.
+  - valida unicidad del contacto en `users` y `auth_identities`.
+- `POST /me/contact-change/confirm`
+  - requiere OTP valido.
+  - solo al confirmar se actualiza `users.email` o `users.phone_e164`.
+  - sincroniza y deja verificada la identidad en `auth_identities`.
+
+## Perfil minimo (`/me/play-eligibility`)
+- Debe cumplir:
+- `alias`
+- `gender` (`M|F|U`)
+- `category` por ladder correspondiente o base
+- `canal_verificado` (`phone_verified` o `email_verified`)
+- Si falta cualquiera:
+- no puede crear partido,
+- no puede ser invitado.
+
+## Perfil completo (enriquecido)
+- `country` (default `CO`)
+- `city`
+- `handedness` (`R|L|U`)
+- `preferred_side` (`drive|reves|both|U`)
+- `birthdate` (nullable)
+- `first_name` y `last_name` (nullable)
+- `first_name/last_name` NO bloquean partidos.
+- `country/city` NO bloquean partidos (si se usan para ranking/filtros).
+
+## CI
+El workflow de GitHub Actions ahora:
+1. Levanta Postgres de servicio.
+2. Ejecuta `alembic upgrade head`.
+3. Valida imports.
+4. Corre tests con `pytest`.
+
+## Scripts utiles
+- `scripts/test_mx_verification.ps1`
+- `scripts/test_ladders_verification.ps1`
+
+## Nota de seguridad
+Si en algun momento un secreto real se subio al repositorio, debes rotarlo inmediatamente.

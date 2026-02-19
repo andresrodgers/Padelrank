@@ -15,6 +15,7 @@ class Settings(BaseSettings):
 
     OTP_TTL_MINUTES: int = 10
     OTP_PEPPER: str = "CHANGE_ME"
+    OTP_REQUEST_COOLDOWN_SECONDS: int = 120
 
     CONFIRM_WINDOW_HOURS: int = 48
 
