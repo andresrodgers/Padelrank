@@ -15,13 +15,13 @@ def get_current_user(
     try:
         payload = decode_token(creds.credentials)
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Token invalido")
     if payload.get("type") != "access":
-        raise HTTPException(status_code=401, detail="Invalid token type")
+        raise HTTPException(status_code=401, detail="Tipo de token invalido")
     user_id = payload.get("sub")
     user = db.get(User, user_id)
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(status_code=401, detail="Usuario no encontrado")
     if user.status != "active":
-        raise HTTPException(status_code=403, detail="User blocked")
+        raise HTTPException(status_code=403, detail="Usuario bloqueado")
     return user

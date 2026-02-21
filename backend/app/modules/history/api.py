@@ -53,7 +53,7 @@ def _normalize_uuid(raw: str, name: str) -> str:
     try:
         return str(UUID(raw))
     except Exception:
-        raise HTTPException(400, f"Invalid {name}")
+        raise HTTPException(400, f"Valor invalido para {name}")
 
 
 def _normalize_ladder(ladder: str | None) -> str | None:
@@ -61,7 +61,7 @@ def _normalize_ladder(ladder: str | None) -> str | None:
         return None
     out = ladder.strip().upper()
     if out not in _VALID_LADDERS:
-        raise HTTPException(400, "ladder must be HM|WM|MX")
+        raise HTTPException(400, "ladder debe ser HM|WM|MX")
     return out
 
 
@@ -69,7 +69,7 @@ def _resolve_timeline_scope(scope: Literal["verified", "pending", "all"], is_sel
     if is_self:
         return scope
     if scope != "verified":
-        raise HTTPException(403, "state_scope pending/all is only allowed for self history")
+        raise HTTPException(403, "state_scope pending/all solo se permite para el historial propio")
     return "verified"
 
 
@@ -80,7 +80,7 @@ def _load_profile_visibility(db: Session, target_user_id: str) -> bool:
         WHERE user_id=:u
     """), {"u": target_user_id}).mappings().first()
     if not row:
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Usuario no encontrado")
     return bool(row["is_public"])
 
 
@@ -107,6 +107,18 @@ def _query_timeline(
     offset: int,
     match_id: str | None = None,
 ):
+    is_public_view = visibility_reason == "public_verified_history"
+    rival_alias_sql = (
+        "up.alias"
+        if not is_public_view
+        else "CASE WHEN up.is_public OR up.user_id=:target_user_id THEN up.alias ELSE '[private]' END"
+    )
+    created_by_alias_sql = (
+        "cp.alias"
+        if not is_public_view
+        else "CASE WHEN cp.is_public OR cp.user_id=:target_user_id THEN cp.alias ELSE '[private]' END"
+    )
+
     where = [
         "1=1",
         _timeline_where_for_scope(state_scope),
@@ -133,7 +145,7 @@ def _query_timeline(
     if club_city is not None:
         city = club_city.strip()
         if not city:
-            raise HTTPException(400, "club_city cannot be empty")
+            raise HTTPException(400, "club_city no puede estar vacio")
         where.append("lower(cl.city)=lower(:club_city)")
         params["club_city"] = city
     if match_id is not None:
@@ -167,12 +179,12 @@ def _query_timeline(
             um.team_no as focus_team_no,
             COALESCE(
                 ARRAY(
-                    SELECT up.alias
+                    SELECT {rival_alias_sql}
                     FROM match_participants mp2
                     JOIN user_profiles up ON up.user_id = mp2.user_id
                     WHERE mp2.match_id = m.id
                       AND mp2.team_no <> um.team_no
-                    ORDER BY up.alias
+                    ORDER BY {rival_alias_sql}
                 ),
                 ARRAY[]::text[]
             ) as rival_aliases,
@@ -183,7 +195,7 @@ def _query_timeline(
                 ELSE false
             END as did_focus_user_win,
             m.created_by::text as created_by,
-            cp.alias as created_by_alias
+            {created_by_alias_sql} as created_by_alias
         FROM user_matches um
         JOIN matches m ON m.id = um.match_id
         JOIN categories c ON c.id = m.category_id
@@ -222,7 +234,7 @@ def history_me(
     db: Session = Depends(get_db),
 ):
     if date_from and date_to and date_from > date_to:
-        raise HTTPException(400, "date_from cannot be greater than date_to")
+        raise HTTPException(400, "date_from no puede ser mayor que date_to")
 
     rows, next_offset = _query_timeline(
         db,
@@ -261,14 +273,14 @@ def history_user(
     db: Session = Depends(get_db),
 ):
     if date_from and date_to and date_from > date_to:
-        raise HTTPException(400, "date_from cannot be greater than date_to")
+        raise HTTPException(400, "date_from no puede ser mayor que date_to")
 
     target_user_id = _normalize_uuid(user_id, "user_id")
     is_self = str(current.id) == target_user_id
     is_public = _load_profile_visibility(db, target_user_id)
 
     if not is_self and not is_public:
-        raise HTTPException(404, "User history not available")
+        raise HTTPException(404, "Historial de usuario no disponible")
 
     effective_scope = _resolve_timeline_scope(state_scope, is_self)
     visibility_reason = "self_participant" if is_self else "public_verified_history"
@@ -306,7 +318,7 @@ def history_match_detail(
     is_self = str(current.id) == target_user_id
     is_public = _load_profile_visibility(db, target_user_id)
     if not is_self and not is_public:
-        raise HTTPException(404, "User history not available")
+        raise HTTPException(404, "Historial de usuario no disponible")
 
     visibility_reason = "self_participant" if is_self else "public_verified_history"
     state_scope: Literal["verified", "pending", "all"] = "all" if is_self else "verified"
@@ -325,14 +337,24 @@ def history_match_detail(
         match_id=match_id,
     )
     if not rows:
-        raise HTTPException(404, "History event not found")
+        raise HTTPException(404, "Evento de historial no encontrado")
     event = rows[0]
 
+    participant_alias_sql = (
+        "up.alias"
+        if is_self
+        else "CASE WHEN up.is_public OR up.user_id=:target_user_id THEN up.alias ELSE '[private]' END"
+    )
+    participant_gender_sql = (
+        "up.gender"
+        if is_self
+        else "CASE WHEN up.is_public OR up.user_id=:target_user_id THEN up.gender ELSE NULL END"
+    )
     parts = db.execute(sa.text("""
         SELECT
             mp.user_id::text as user_id,
-            up.alias as alias,
-            up.gender as gender,
+            """ + participant_alias_sql + """ as alias,
+            """ + participant_gender_sql + """ as gender,
             mp.team_no as team_no,
             COALESCE(mc.status, 'pending') as confirmation_status,
             mc.decided_at as decided_at
@@ -342,7 +364,10 @@ def history_match_detail(
           ON mc.match_id = mp.match_id AND mc.user_id = mp.user_id
         WHERE mp.match_id=:m
         ORDER BY mp.team_no, up.alias
-    """), {"m": _normalize_uuid(match_id, "match_id")}).mappings().all()
+    """), {
+        "m": _normalize_uuid(match_id, "match_id"),
+        "target_user_id": target_user_id,
+    }).mappings().all()
     participants = [HistoryParticipantOut(**p) for p in parts]
 
     focus_team = event.focus_team_no

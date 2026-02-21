@@ -25,6 +25,13 @@ from app.schemas.match import (
 
 router = APIRouter()
 
+def _normalize_match_id(match_id: str) -> str:
+    try:
+        return str(UUID(match_id))
+    except Exception:
+        raise HTTPException(400, "match_id invalido")
+
+
 def _assert_is_participant(db: Session, match_id: str, user_id: str):
     ok = db.execute(sa.text("""
         SELECT 1
@@ -32,7 +39,19 @@ def _assert_is_participant(db: Session, match_id: str, user_id: str):
         WHERE match_id=:m AND user_id=:u
     """), {"m": match_id, "u": user_id}).first()
     if not ok:
-        raise HTTPException(403, "Not a participant")
+        raise HTTPException(403, "No es participante")
+
+
+def _lock_creator_for_match_creation(db: Session, user_id: str):
+    row = db.execute(sa.text("""
+        SELECT id
+        FROM users
+        WHERE id=:u
+        FOR UPDATE
+    """), {"u": user_id}).first()
+    if not row:
+        raise HTTPException(401, "Usuario no encontrado")
+
 
 def _assert_block_rules(db: Session, user_id):
     uid = str(user_id)
@@ -65,7 +84,7 @@ def _assert_block_rules(db: Session, user_id):
     expired = int(expired_effective) + int(expired_materialized)
 
     if pending >= 2 or expired >= 1:
-        raise HTTPException(403, "Blocked from creating new match (pending/expired limit)")
+        raise HTTPException(403, "Bloqueado para crear nuevo partido (limite de pendientes/expirados)")
 
 def _fetch_profiles(db: Session, user_ids: list[UUID]):
     ids_bp = sa.bindparam("ids", expanding=True)
@@ -93,12 +112,12 @@ def _determine_ladder_from_genders(genders: list[str]) -> str:
         return "WM"
     if m == 2 and f == 2:
         return "MX"
-    raise HTTPException(400, "CombinaciÃ³n de gÃ©neros no vÃ¡lida. Utilice 4M (HM), 4F (WM) o 2M2F (MX).")
+    raise HTTPException(400, "Combinacion de generos no valida. Utilice 4M (HM), 4F (WM) o 2M2F (MX).")
 
 def _derive_match_category_id(db: Session, ladder_code: str, participant_ids: list[UUID]) -> str:
     """
-    C3.1: category_id del match = categorÃ­a mediana de los 4 participantes (por sort_order)
-    en el ladder del match (HM/WM/MX). Solo etiqueta para analÃ­tica.
+    C3.1: category_id del match = categoria mediana de los 4 participantes (por sort_order)
+    en el ladder del match (HM/WM/MX). Solo etiqueta para analitica.
     """
     rows = db.execute(sa.text("""
         SELECT c.sort_order
@@ -109,7 +128,7 @@ def _derive_match_category_id(db: Session, ladder_code: str, participant_ids: li
     """), {"l": ladder_code, "ids": participant_ids}).mappings().all()
 
     if len(rows) != 4:
-        raise HTTPException(400, "Falta el estado/categorÃ­a de la tabla para los participantes.")
+        raise HTTPException(400, "Falta el estado/categoria de la tabla para los participantes.")
 
     sort_orders = sorted(int(r["sort_order"]) for r in rows)
 
@@ -123,7 +142,7 @@ def _derive_match_category_id(db: Session, ladder_code: str, participant_ids: li
     """), {"l": ladder_code}).mappings().all()
 
     if not cats:
-        raise HTTPException(400, "No hay categorÃ­as para la tabla")
+        raise HTTPException(400, "No hay categorias para la tabla")
 
     best = min(
         cats,
@@ -133,6 +152,7 @@ def _derive_match_category_id(db: Session, ladder_code: str, participant_ids: li
 
 @router.post("", response_model=MatchOut)
 def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
+    _lock_creator_for_match_creation(db, str(current.id))
     _assert_block_rules(db, current.id)
 
     if len(payload.participants) != 4:
@@ -141,10 +161,10 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
     try:
         participant_ids = [UUID(p.user_id) for p in payload.participants]
     except Exception:
-        raise HTTPException(400, "Formato de ID de participante invÃ¡lido")
+        raise HTTPException(400, "Formato de ID de participante invalido")
 
     if len(set(participant_ids)) != 4:
-        raise HTTPException(400, "Los participantes deben ser unicos.")
+        raise HTTPException(400, "Los participantes deben ser unicos")
     if UUID(str(current.id)) not in participant_ids:
         raise HTTPException(403, "El creador del partido debe estar entre los 4 participantes.")
     t1 = [p for p in payload.participants if p.team_no == 1]
@@ -294,6 +314,7 @@ def create_match(payload: MatchCreateIn, current=Depends(get_current_user), db: 
 
 @router.get("/{match_id}", response_model=MatchOut)
 def get_match(match_id: str, current=Depends(get_current_user), db: Session = Depends(get_db)):
+    match_id = _normalize_match_id(match_id)
     _assert_is_participant(db, match_id, str(current.id))
 
     row = db.execute(sa.text("""
@@ -316,7 +337,7 @@ def get_match(match_id: str, current=Depends(get_current_user), db: Session = De
         WHERE id=:m
     """), {"m": match_id}).mappings().first()
     if not row:
-        raise HTTPException(404, "Match not found")
+        raise HTTPException(404, "Partido no encontrado")
     return MatchOut(**row)
 
 def _apply_ranking_for_match(db: Session, match_id: str):
@@ -450,6 +471,7 @@ def _apply_ranking_for_match(db: Session, match_id: str):
 
 @router.get("/{match_id}/confirmations", response_model=MatchConfirmationsOut)
 def match_confirmations(match_id: str, current=Depends(get_current_user), db: Session = Depends(get_db)):
+    match_id = _normalize_match_id(match_id)
     _assert_is_participant(db, match_id, str(current.id))
 
     m = db.execute(sa.text("""
@@ -467,7 +489,7 @@ def match_confirmations(match_id: str, current=Depends(get_current_user), db: Se
     """), {"m": match_id}).mappings().first()
 
     if not m:
-        raise HTTPException(404, "Match not found")
+        raise HTTPException(404, "Partido no encontrado")
 
     rows = db.execute(sa.text("""
         SELECT
@@ -497,6 +519,7 @@ def match_confirmations(match_id: str, current=Depends(get_current_user), db: Se
 
 @router.get("/{match_id}/detail", response_model=MatchDetailOut)
 def match_detail(match_id: str, current=Depends(get_current_user), db: Session = Depends(get_db)):
+    match_id = _normalize_match_id(match_id)
     _assert_is_participant(db, match_id, str(current.id))
 
     m = db.execute(sa.text("""
@@ -519,7 +542,7 @@ def match_detail(match_id: str, current=Depends(get_current_user), db: Session =
         WHERE m.id=:m
     """), {"m": match_id}).mappings().first()
     if not m:
-        raise HTTPException(404, "Match not found")
+        raise HTTPException(404, "Partido no encontrado")
     
     if m["status"] == "pending_confirm" and m["confirmation_deadline"] < now_utc():
         db.execute(sa.text("""
@@ -581,6 +604,7 @@ def match_detail(match_id: str, current=Depends(get_current_user), db: Session =
 
 @router.post("/{match_id}/confirm", response_model=ConfirmOut)
 def confirm_match(match_id: str, payload: ConfirmIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
+    match_id = _normalize_match_id(match_id)
     _assert_is_participant(db, match_id, str(current.id))
 
     m = db.execute(sa.text("""
@@ -606,12 +630,12 @@ def confirm_match(match_id: str, payload: ConfirmIn, current=Depends(get_current
             WHERE id=:m AND status='pending_confirm'
         """), {"m": match_id})
         db.commit()
-        raise HTTPException(409, "Patido expirado")
+        raise HTTPException(409, "Partido expirado")
 
     if m["status"] != "pending_confirm":
         raise HTTPException(
             status_code=409,
-            detail=f"El partido no estÃ¡ pendiente de confirmaciÃ³n (estado={m['status']})."
+            detail=f"El partido no esta pendiente de confirmacion (estado={m['status']})."
         )
 
 
@@ -629,7 +653,7 @@ def confirm_match(match_id: str, payload: ConfirmIn, current=Depends(get_current
         if int(m["proposal_count"] or 0) >= settings.MAX_SCORE_PROPOSALS:
             raise HTTPException(
                 status_code=409,
-                detail="LÃ­mite de apelaciones alcanzado (mÃ¡ximo 2)."
+                detail="Limite de apelaciones alcanzado (maximo 2)."
             )
 
         score_in = MatchScoreIn(score_json=payload.score_json)

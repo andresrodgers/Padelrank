@@ -18,9 +18,9 @@ def api() -> ApiClient:
     try:
         health = client.call("GET", "/health")
     except Exception as exc:  # pragma: no cover - guard rail
-        pytest.skip(f"API no disponible en {base_url}: {exc}")
+        pytest.fail(f"API no disponible en {base_url}: {exc}")
     if not isinstance(health, dict) or not health.get("ok"):
-        pytest.skip(f"Health check invalido en {base_url}: {health}")
+        pytest.fail(f"Health check invalido en {base_url}: {health}")
     return client
 
 

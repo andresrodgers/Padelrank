@@ -21,13 +21,20 @@ Backend API para registro de partidos, confirmaciones y ranking de padel.
 `/.env` esta ignorado por git. No guardes secretos reales en commits.
 
 ## Runtime tuning (escala backend)
-- `API_WORKERS` (default `4`): procesos de Uvicorn para concurrencia.
+- `API_WORKERS` (default `2`): procesos de Uvicorn para concurrencia.
 - `DB_POOL_SIZE` / `DB_MAX_OVERFLOW`: tuning del pool SQLAlchemy por worker.
+- Defaults conservadores: `DB_POOL_SIZE=5`, `DB_MAX_OVERFLOW=5`.
+- Presupuesto recomendado: `API_WORKERS * (DB_POOL_SIZE + DB_MAX_OVERFLOW)` menor al limite real de conexiones de Postgres.
 - `DB_POOL_TIMEOUT_SECONDS` / `DB_POOL_RECYCLE_SECONDS`: estabilidad de conexiones.
 
 ## Seguridad backend
+- `ENV` en backend es `prod` por defecto (seguro). Para desarrollo local usa `ENV=dev`.
 - `ALLOWED_HOSTS`: lista separada por comas para validar Host header.
 - `SECURITY_HEADERS_ENABLED=true`: activa headers de seguridad HTTP.
+- Retencion auth configurable por entorno:
+- `AUTH_OTP_RETENTION_DAYS`
+- `AUTH_LOGIN_ATTEMPTS_RETENTION_DAYS`
+- `USER_CONTACT_CHANGES_RETENTION_DAYS`
 - En produccion define `ALLOWED_HOSTS` con tus dominios reales (sin comodines globales).
 
 ## Arranque (modo normal)
@@ -130,6 +137,7 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 - `GET /history/users/{user_id}`: timeline publico (solo verificados para terceros).
 - `GET /history/users/{user_id}/matches/{match_id}`: detalle auditable del evento.
 - Filtros: `ladder`, `date_from`, `date_to`, `state_scope`, `club_id`, `club_city`.
+- En vistas publicas, jugadores con perfil privado aparecen enmascarados como `[private]`.
 
 ## Analytics (read model materializado)
 - `GET /analytics/me`: metricas privadas por ladder.
@@ -138,16 +146,23 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 - Es idempotente por `(user_id, match_id)` para evitar dobles conteos.
 - Rebuild completo (admin/internal): `cd backend && python scripts/rebuild_analytics.py`.
 
+## Mantenimiento operativo (auth)
+- Limpieza de artefactos antiguos:
+- `cd backend && python scripts/cleanup_auth_artifacts.py`
+- Recomendada su ejecucion periodica (cron o scheduler interno).
+
 ## CI
 El workflow de GitHub Actions ahora:
 1. Levanta Postgres de servicio.
 2. Ejecuta `alembic upgrade head`.
 3. Valida imports.
-4. Corre tests con `pytest`.
+4. Levanta la API (`uvicorn`) y espera `/health`.
+5. Corre tests con integracion habilitada (`RUN_API_INTEGRATION=1 pytest -q`).
 
 ## Tests (unificados)
 - Carpeta unica: `backend/tests`
 - Unit tests: `cd backend && pytest -q`
+- Regresion minima core (Ranking/History/Analytics): `cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_regression_core_modules.py`
 - Integracion API (requiere API arriba): `cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_api_integration.py`
 - Performance smoke (opcional): `cd backend && RUN_API_INTEGRATION=1 RUN_PERF_TESTS=1 pytest -q tests/test_ranking_performance.py`
 - History API (integracion): `cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_history_api.py`

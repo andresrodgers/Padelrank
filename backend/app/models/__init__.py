@@ -7,4 +7,9 @@ from app.models.user_ladder_state import UserLadderState
 from app.models.match import Match, MatchParticipant, MatchConfirmation, MatchScore, MatchDispute
 from app.models.rating_event import RatingEvent
 from app.models.audit_log import AuditLog
-from app.models.analytics import UserAnalyticsState, UserAnalyticsMatchApplied
+from app.models.analytics import (
+    UserAnalyticsState,
+    UserAnalyticsMatchApplied,
+    UserAnalyticsPartnerStats,
+    UserAnalyticsRivalStats,
+)

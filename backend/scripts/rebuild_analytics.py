@@ -7,7 +7,7 @@ def main():
     try:
         rebuild_analytics(db)
         db.commit()
-        print("ok: analytics rebuilt")
+        print("ok: analitica reconstruida")
     except Exception:
         db.rollback()
         raise

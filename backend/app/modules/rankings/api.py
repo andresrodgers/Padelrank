@@ -1,11 +1,27 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 import sqlalchemy as sa
+from uuid import UUID
 
 from app.db.session import get_db
 from app.schemas.ranking import RankingOut, RankingRow
 
 router = APIRouter()
+_VALID_LADDERS = {"HM", "WM", "MX"}
+
+
+def _normalize_ladder(ladder_code: str) -> str:
+    out = ladder_code.strip().upper()
+    if out not in _VALID_LADDERS:
+        raise HTTPException(400, "ladder_code debe ser HM|WM|MX")
+    return out
+
+
+def _normalize_category_id(category_id: str) -> str:
+    try:
+        return str(UUID(category_id))
+    except Exception:
+        raise HTTPException(400, "category_id debe ser un UUID valido")
 
 @router.get("/{ladder_code}/{category_id}", response_model=RankingOut)
 def ranking(
@@ -15,17 +31,19 @@ def ranking(
     city: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
+    ladder_norm = _normalize_ladder(ladder_code)
+    category_id_norm = _normalize_category_id(category_id)
     country_norm = country.strip().upper() if country is not None else None
     city_norm = city.strip() if city is not None else None
 
     if country_norm == "":
-        raise HTTPException(400, "country cannot be empty")
+        raise HTTPException(400, "country no puede estar vacio")
     if city_norm == "":
-        raise HTTPException(400, "city cannot be empty")
+        raise HTTPException(400, "city no puede estar vacio")
     if country_norm is not None and len(country_norm) != 2:
-        raise HTTPException(400, "country must be ISO-2 (e.g. CO)")
+        raise HTTPException(400, "country debe ser ISO-2 (ej. CO)")
     if city_norm is not None and country_norm is None:
-        raise HTTPException(400, "city filter requires country")
+        raise HTTPException(400, "el filtro city requiere country")
 
     where = [
         "s.ladder_code=:l",
@@ -33,8 +51,8 @@ def ranking(
         "p.is_public=true",
     ]
     params: dict[str, str] = {
-        "l": ladder_code,
-        "c": category_id,
+        "l": ladder_norm,
+        "c": category_id_norm,
     }
     if country_norm is not None:
         where.append("p.country=:country")
@@ -57,7 +75,7 @@ def ranking(
     """), params).mappings().all()
 
     return RankingOut(
-        ladder_code=ladder_code,
-        category_id=category_id,
+        ladder_code=ladder_norm,
+        category_id=category_id_norm,
         rows=[RankingRow(**r) for r in rows],
     )

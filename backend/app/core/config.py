@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=None, extra="ignore")
 
-    ENV: str = "dev"
+    ENV: str = "prod"
     
     MAX_SCORE_PROPOSALS: int = 2
 
@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     OTP_TTL_MINUTES: int = 10
     OTP_PEPPER: str = "CHANGE_ME"
     OTP_REQUEST_COOLDOWN_SECONDS: int = 120
+    AUTH_OTP_RETENTION_DAYS: int = 30
+    AUTH_LOGIN_ATTEMPTS_RETENTION_DAYS: int = 30
+    USER_CONTACT_CHANGES_RETENTION_DAYS: int = 30
 
     CONFIRM_WINDOW_HOURS: int = 48
 
@@ -24,12 +27,12 @@ class Settings(BaseSettings):
 
     ELO_K: int = 32
 
-    DB_POOL_SIZE: int = 10
-    DB_MAX_OVERFLOW: int = 20
+    DB_POOL_SIZE: int = 5
+    DB_MAX_OVERFLOW: int = 5
     DB_POOL_TIMEOUT_SECONDS: int = 30
     DB_POOL_RECYCLE_SECONDS: int = 1800
 
-    API_WORKERS: int = 4
+    API_WORKERS: int = 2
     ALLOWED_HOSTS: str = "localhost,127.0.0.1"
     SECURITY_HEADERS_ENABLED: bool = True
 

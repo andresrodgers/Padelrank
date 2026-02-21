@@ -154,3 +154,38 @@ def test_history_detail_traceability_and_club_filters(api, identity_factory):
             token=outsider["token"],
         )
     assert pending_hidden.value.status_code == 404
+
+
+def test_history_public_masks_private_participants(api, identity_factory):
+    users = _build_mx_users(api, identity_factory, "hist_mask")
+    focus = users[0]
+    private_rival = users[1]
+    viewer = create_user_with_profile(
+        api,
+        identity_factory,
+        alias_prefix="hist_mask_viewer",
+        gender="M",
+        primary_category_code="6ta",
+        country="CO",
+        city="Bogota",
+        is_public=True,
+    )
+
+    api.call("PATCH", "/me/profile", token=private_rival["token"], body={"is_public": False})
+
+    verified_match = create_match(api, focus["token"], u1=users[0], u2=users[1], u3=users[2], u4=users[3])
+    confirm_match(api, users[1]["token"], verified_match["id"])
+
+    timeline_rows = api.call("GET", f"/history/users/{focus['id']}", token=viewer["token"])["rows"]
+    match_row = next(r for r in timeline_rows if r["match_id"] == verified_match["id"])
+    assert "[private]" in match_row["rival_aliases"]
+    assert private_rival["alias"] not in match_row["rival_aliases"]
+
+    detail = api.call(
+        "GET",
+        f"/history/users/{focus['id']}/matches/{verified_match['id']}",
+        token=viewer["token"],
+    )
+    private_part = next(p for p in detail["participants"] if p["user_id"] == private_rival["id"])
+    assert private_part["alias"] == "[private]"
+    assert private_part["gender"] is None

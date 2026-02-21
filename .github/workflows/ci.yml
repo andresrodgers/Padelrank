@@ -27,6 +27,7 @@ jobs:
         working-directory: backend
     env:
       DATABASE_URL: postgresql+psycopg://padel:padel@localhost:5432/padel_mvp
+      ENV: dev
       JWT_SECRET: ci_dummy_secret
       OTP_PEPPER: ci_dummy_pepper
       OTP_REQUEST_COOLDOWN_SECONDS: 120
@@ -51,5 +52,23 @@ jobs:
       - name: Import check
         run: python -c "import app; import app.main"
 
-      - name: Run tests
-        run: pytest -q
+      - name: Start API
+        run: |
+          nohup uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/api.log 2>&1 &
+          for i in {1..40}; do
+            if curl -fsS http://127.0.0.1:8000/health > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/health > /dev/null
+
+      - name: Run Core Regression Tests
+        run: RUN_API_INTEGRATION=1 pytest -q tests/test_regression_core_modules.py --maxfail=1
+
+      - name: Run Full Test Suite
+        run: RUN_API_INTEGRATION=1 pytest -q
+
+      - name: Show API logs (on failure)
+        if: failure()
+        run: cat /tmp/api.log

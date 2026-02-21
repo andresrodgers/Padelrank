@@ -21,11 +21,11 @@ class ContactIn(BaseModel):
         has_split = bool(self.country_code) and bool(self.phone_number)
         has_phone = has_e164 or has_split
         if has_email and has_phone:
-            raise ValueError("Provide either email or phone fields, not both")
+            raise ValueError("Provee email o telefono, pero no ambos")
         if not has_email and not has_phone:
-            raise ValueError("Provide email or phone fields")
+            raise ValueError("Debes proveer email o telefono")
         if has_email and not looks_like_email(self.email or ""):
-            raise ValueError("Invalid email")
+            raise ValueError("Email invalido")
         return self
 
 

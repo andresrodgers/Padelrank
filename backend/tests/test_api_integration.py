@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from urllib import error, request
+
 import pytest
 
 from tests.testkit import (
@@ -162,3 +164,51 @@ def test_ranking_scope_filters(api, identity_factory):
     with pytest.raises(ApiError) as invalid_country:
         api.call("GET", f"/rankings/HM/{category_id}?country=COL")
     assert invalid_country.value.status_code == 400
+
+
+def test_invalid_ids_return_400(api, identity_factory):
+    focus = create_user_with_profile(
+        api,
+        identity_factory,
+        alias_prefix="invalid_ids_focus",
+        gender="M",
+        primary_category_code="6ta",
+        country="CO",
+        city="Neiva",
+    )
+
+    with pytest.raises(ApiError) as invalid_ranking_category:
+        api.call("GET", "/rankings/HM/not-a-uuid")
+    assert invalid_ranking_category.value.status_code == 400
+
+    with pytest.raises(ApiError) as invalid_match_id:
+        api.call("GET", "/matches/not-a-uuid", token=focus["token"])
+    assert invalid_match_id.value.status_code == 400
+
+    with pytest.raises(ApiError) as invalid_analytics_user_id:
+        api.call("GET", "/analytics/users/not-a-uuid", token=focus["token"])
+    assert invalid_analytics_user_id.value.status_code == 400
+
+    with pytest.raises(ApiError) as invalid_trend_interval:
+        api.call("GET", "/analytics/me/dashboard?ladder=MX&trend_interval=year", token=focus["token"])
+    assert invalid_trend_interval.value.status_code == 400
+
+
+def test_health_security_headers_and_trusted_host(api):
+    req = request.Request(url=f"{api.base_url}/health", method="GET")
+    with request.urlopen(req, timeout=10) as resp:
+        assert resp.status == 200
+        assert resp.headers.get("X-Content-Type-Options") == "nosniff"
+        assert resp.headers.get("X-Frame-Options") == "DENY"
+        assert resp.headers.get("Referrer-Policy") == "strict-origin-when-cross-origin"
+        assert resp.headers.get("Permissions-Policy") == "camera=(), microphone=(), geolocation=()"
+        assert resp.headers.get("Content-Security-Policy") == "frame-ancestors 'none'; base-uri 'self'"
+
+    bad_host_req = request.Request(
+        url=f"{api.base_url}/health",
+        method="GET",
+        headers={"Host": "invalid-host.local"},
+    )
+    with pytest.raises(error.HTTPError) as invalid_host:
+        request.urlopen(bad_host_req, timeout=10)
+    assert invalid_host.value.code == 400

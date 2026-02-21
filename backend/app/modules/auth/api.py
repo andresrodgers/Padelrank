@@ -44,19 +44,19 @@ def _normalize_phone(phone_e164: str | None, country_code: str | None, phone_num
             raw = "+" + raw
         digits = "".join(ch for ch in raw if ch.isdigit())
         if not digits:
-            raise HTTPException(400, "Invalid phone")
+            raise HTTPException(400, "Telefono invalido")
         return "+" + digits
     cc = (country_code or "").strip().replace("+", "")
     nsn = "".join(ch for ch in (phone_number or "").strip() if ch.isdigit())
     if not cc or not nsn:
-        raise HTTPException(400, "country_code and phone_number are required")
+        raise HTTPException(400, "country_code y phone_number son obligatorios")
     return f"+{cc}{nsn}"
 
 
 def _normalize_email(email: str | None) -> str:
     raw = (email or "").strip().lower()
     if not raw or "@" not in raw or "." not in raw.split("@")[-1]:
-        raise HTTPException(400, "Invalid email")
+        raise HTTPException(400, "Email invalido")
     return raw
 
 
@@ -115,17 +115,17 @@ def _consume_otp(db: Session, contact_kind: str, contact_value: str, purpose: st
         FOR UPDATE
     """), {"k": contact_kind, "v": contact_value, "p": purpose}).mappings().first()
     if not row:
-        raise HTTPException(400, "OTP not found")
+        raise HTTPException(400, "OTP no encontrado")
     if row["consumed_at"] is not None:
-        raise HTTPException(400, "OTP already used")
+        raise HTTPException(400, "OTP ya utilizado")
     if now_utc() > row["expires_at"]:
-        raise HTTPException(400, "OTP expired")
+        raise HTTPException(400, "OTP expirado")
     if row["attempts"] >= 5:
-        raise HTTPException(400, "Too many attempts")
+        raise HTTPException(400, "Demasiados intentos")
     if otp_hash(code) != row["code_hash"]:
         db.execute(sa.text("UPDATE auth_otps SET attempts=attempts+1 WHERE id=:id"), {"id": row["id"]})
         db.commit()
-        raise HTTPException(400, "Invalid OTP")
+        raise HTTPException(400, "OTP invalido")
     db.execute(sa.text("UPDATE auth_otps SET consumed_at=now() WHERE id=:id"), {"id": row["id"]})
 
 
@@ -168,7 +168,7 @@ def _check_login_rate_limit(db: Session, login_key_hash: str):
           AND created_at >= (now() - interval '15 minutes')
     """), {"k": login_key_hash}).scalar_one())
     if failed >= 8:
-        raise HTTPException(429, "Too many login attempts, try again later")
+        raise HTTPException(429, "Demasiados intentos de inicio de sesion, intenta mas tarde")
 
 
 def _record_login_attempt(db: Session, login_key_hash: str, success: bool):
@@ -187,7 +187,7 @@ def otp_request(payload: OTPRequestIn, db: Session = Depends(get_db)):
     if payload.purpose == "password_reset":
         ident = _get_identity(db, contact_kind, contact_value)
         if not ident or not ident["is_verified"]:
-            # Avoid account enumeration on reset flow.
+            # Evita enumerar cuentas en el flujo de reseteo.
             return OTPRequestOut(ok=True, purpose=payload.purpose)
 
     out = _request_otp(db, contact_kind, contact_value, payload.purpose)
@@ -209,7 +209,7 @@ def register_complete(payload: RegisterCompleteIn, db: Session = Depends(get_db)
             SELECT 1 FROM auth_credentials WHERE user_id=:u
         """), {"u": user_id}).first()
         if cred:
-            raise HTTPException(409, "Account already registered. Use login.")
+            raise HTTPException(409, "La cuenta ya esta registrada. Usa login.")
         db.execute(sa.text("""
             UPDATE auth_identities
             SET is_verified=true, verified_at=now()
@@ -233,7 +233,7 @@ def register_complete(payload: RegisterCompleteIn, db: Session = Depends(get_db)
             VALUES (:u, :k, :v, true, now())
         """), {"u": user_id, "k": contact_kind, "v": contact_value})
 
-    # Keep mirror fields in users for app-level reads.
+    # Mantiene campos espejo en users para lecturas de aplicacion.
     if contact_kind == "phone":
         db.execute(sa.text("""
             UPDATE users
@@ -257,18 +257,21 @@ def register_complete(payload: RegisterCompleteIn, db: Session = Depends(get_db)
     """), {"u": user_id}).first()
     if not exists_profile:
         suffix = (contact_value.split("@")[0][:4] if contact_kind == "email" else contact_value[-4:])
-        alias = f"player_{suffix}"
-        n = 0
-        while True:
-            taken = db.execute(sa.text("SELECT 1 FROM user_profiles WHERE lower(alias)=lower(:a)"), {"a": alias}).first()
-            if not taken:
+        base_alias = f"player_{suffix}"
+        inserted = False
+        for attempt in range(20):
+            alias = base_alias if attempt == 0 else f"{base_alias}_{uuid4().hex[:6]}"
+            row = db.execute(sa.text("""
+                INSERT INTO user_profiles (user_id, alias, gender, is_public)
+                VALUES (:u, :a, 'U', true)
+                ON CONFLICT DO NOTHING
+                RETURNING 1
+            """), {"u": user_id, "a": alias}).first()
+            if row:
+                inserted = True
                 break
-            n += 1
-            alias = f"player_{suffix}_{n}"
-        db.execute(sa.text("""
-            INSERT INTO user_profiles (user_id, alias, gender, is_public)
-            VALUES (:u, :a, 'U', true)
-        """), {"u": user_id, "a": alias})
+        if not inserted:
+            raise HTTPException(409, "No se pudo asignar un alias de perfil")
 
     tokens = _create_session_tokens(db, user_id)
     audit(db, user_id, "auth", str(user_id), "register_completed", {"contact_kind": contact_kind})
@@ -286,7 +289,7 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
     if not ident or not ident["is_verified"]:
         _record_login_attempt(db, login_key_hash, False)
         db.commit()
-        raise HTTPException(401, "Invalid credentials")
+        raise HTTPException(401, "Credenciales invalidas")
 
     cred = db.execute(sa.text("""
         SELECT password_hash
@@ -296,13 +299,13 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
     if not cred or not verify_password(payload.password, cred["password_hash"]):
         _record_login_attempt(db, login_key_hash, False)
         db.commit()
-        raise HTTPException(401, "Invalid credentials")
+        raise HTTPException(401, "Credenciales invalidas")
 
     user = db.get(User, ident["user_id"])
     if not user:
-        raise HTTPException(401, "User not found")
+        raise HTTPException(401, "Usuario no encontrado")
     if user.status != "active":
-        raise HTTPException(403, "User blocked")
+        raise HTTPException(403, "Usuario bloqueado")
 
     _record_login_attempt(db, login_key_hash, True)
     db.execute(sa.text("UPDATE users SET last_login_at=now() WHERE id=:u"), {"u": ident["user_id"]})
@@ -333,7 +336,7 @@ def password_reset_confirm(payload: PasswordResetConfirmIn, db: Session = Depend
     _consume_otp(db, contact_kind, contact_value, "password_reset", payload.code)
     ident = _get_identity(db, contact_kind, contact_value)
     if not ident:
-        raise HTTPException(400, "Identity not found")
+        raise HTTPException(400, "Identidad no encontrada")
 
     exists = db.execute(sa.text("""
         SELECT 1 FROM auth_credentials WHERE user_id=:u
@@ -366,14 +369,14 @@ def refresh(payload: RefreshIn, db: Session = Depends(get_db)):
     try:
         decoded = decode_token(payload.refresh_token)
     except Exception:
-        raise HTTPException(401, "Invalid refresh token")
+        raise HTTPException(401, "Refresh token invalido")
     if decoded.get("type") != "refresh":
-        raise HTTPException(401, "Invalid token type")
+        raise HTTPException(401, "Tipo de token invalido")
 
     user_id = decoded.get("sub")
     sid = decoded.get("sid")
     if not sid:
-        raise HTTPException(401, "Invalid refresh token")
+        raise HTTPException(401, "Refresh token invalido")
 
     row = db.execute(sa.text("""
         SELECT id, user_id::text AS user_id, refresh_hash, expires_at, revoked_at
@@ -382,19 +385,19 @@ def refresh(payload: RefreshIn, db: Session = Depends(get_db)):
         FOR UPDATE
     """), {"sid": sid}).mappings().first()
     if not row or row["user_id"] != str(user_id):
-        raise HTTPException(401, "Session not found")
+        raise HTTPException(401, "Sesion no encontrada")
     if row["revoked_at"] is not None:
-        raise HTTPException(401, "Session revoked")
+        raise HTTPException(401, "Sesion revocada")
     if now_utc() > row["expires_at"]:
-        raise HTTPException(401, "Session expired")
+        raise HTTPException(401, "Sesion expirada")
     if row["refresh_hash"] != hash_refresh_token(payload.refresh_token):
-        raise HTTPException(401, "Invalid refresh token")
+        raise HTTPException(401, "Refresh token invalido")
 
     user = db.get(User, user_id)
     if not user:
-        raise HTTPException(401, "User not found")
+        raise HTTPException(401, "Usuario no encontrado")
     if user.status != "active":
-        raise HTTPException(403, "User blocked")
+        raise HTTPException(403, "Usuario bloqueado")
 
     new_tokens = _create_session_tokens(db, str(user_id))
     new_payload = decode_token(new_tokens.refresh_token)
