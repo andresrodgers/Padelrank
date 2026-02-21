@@ -29,6 +29,8 @@ class Match(Base):
     __table_args__ = (
         sa.Index("ix_matches_creator_status_deadline", "created_by", "status", "confirmation_deadline"),
         sa.Index("ix_matches_ladder_cat_status_played", "ladder_code", "category_id", "status", sa.text("played_at DESC")),
+        sa.Index("ix_matches_status_played_created", "status", sa.text("played_at DESC"), sa.text("created_at DESC")),
+        sa.Index("ix_matches_club_played", "club_id", sa.text("played_at DESC")),
         sa.CheckConstraint("status in ('pending_confirm','verified','disputed','expired','void')", name="ck_match_status"),
     )
 
@@ -41,6 +43,7 @@ class MatchParticipant(Base):
     __table_args__ = (
         sa.CheckConstraint("team_no in (1,2)", name="ck_team_no"),
         sa.Index("ix_match_participants_match", "match_id"),
+        sa.Index("ix_match_participants_user_match", "user_id", "match_id"),
     )
 
 class MatchScore(Base):

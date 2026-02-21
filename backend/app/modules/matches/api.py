@@ -13,6 +13,7 @@ from app.core.security import now_utc
 from app.db.session import get_db
 from app.services.audit import audit
 from app.services.elo import compute_elo
+from app.services.analytics import apply_verified_match_analytics
 
 from app.services.score_features import extract_score_features, mov_weight_from_features
 
@@ -731,6 +732,7 @@ def confirm_match(match_id: str, payload: ConfirmIn, current=Depends(get_current
         """), {"m": match_id})
 
         _apply_ranking_for_match(db, match_id)
+        apply_verified_match_analytics(db, match_id)
 
     db.commit()
     return ConfirmOut(ok=True, confirmed_count=confirmed_count, teams_confirmed=teams_confirmed)

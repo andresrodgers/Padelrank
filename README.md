@@ -20,6 +20,16 @@ Backend API para registro de partidos, confirmaciones y ranking de padel.
 
 `/.env` esta ignorado por git. No guardes secretos reales en commits.
 
+## Runtime tuning (escala backend)
+- `API_WORKERS` (default `4`): procesos de Uvicorn para concurrencia.
+- `DB_POOL_SIZE` / `DB_MAX_OVERFLOW`: tuning del pool SQLAlchemy por worker.
+- `DB_POOL_TIMEOUT_SECONDS` / `DB_POOL_RECYCLE_SECONDS`: estabilidad de conexiones.
+
+## Seguridad backend
+- `ALLOWED_HOSTS`: lista separada por comas para validar Host header.
+- `SECURITY_HEADERS_ENABLED=true`: activa headers de seguridad HTTP.
+- En produccion define `ALLOWED_HOSTS` con tus dominios reales (sin comodines globales).
+
 ## Arranque (modo normal)
 1. Levantar servicios:
 ```bash
@@ -108,6 +118,26 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 - `first_name/last_name` NO bloquean partidos.
 - `country/city` NO bloquean partidos (si se usan para ranking/filtros).
 
+## Ranking (global/pais/ciudad)
+- Endpoint unico: `GET /rankings/{ladder_code}/{category_id}`
+- Global: sin query params.
+- Pais: `?country=CO` (ISO-2).
+- Ciudad: `?country=CO&city=Neiva`.
+- El rating siempre sale de `user_ladder_state` (uno por `user + ladder + categoria`), sin duplicar por ubicacion.
+
+## History (timeline auditable)
+- `GET /history/me`: timeline del usuario autenticado.
+- `GET /history/users/{user_id}`: timeline publico (solo verificados para terceros).
+- `GET /history/users/{user_id}/matches/{match_id}`: detalle auditable del evento.
+- Filtros: `ladder`, `date_from`, `date_to`, `state_scope`, `club_id`, `club_city`.
+
+## Analytics (read model materializado)
+- `GET /analytics/me`: metricas privadas por ladder.
+- `GET /analytics/users/{user_id}`: metricas publicas (si perfil publico).
+- Se actualiza incrementalmente cuando un partido pasa a `verified`.
+- Es idempotente por `(user_id, match_id)` para evitar dobles conteos.
+- Rebuild completo (admin/internal): `cd backend && python scripts/rebuild_analytics.py`.
+
 ## CI
 El workflow de GitHub Actions ahora:
 1. Levanta Postgres de servicio.
@@ -115,9 +145,15 @@ El workflow de GitHub Actions ahora:
 3. Valida imports.
 4. Corre tests con `pytest`.
 
-## Scripts utiles
-- `scripts/test_mx_verification.ps1`
-- `scripts/test_ladders_verification.ps1`
+## Tests (unificados)
+- Carpeta unica: `backend/tests`
+- Unit tests: `cd backend && pytest -q`
+- Integracion API (requiere API arriba): `cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_api_integration.py`
+- Performance smoke (opcional): `cd backend && RUN_API_INTEGRATION=1 RUN_PERF_TESTS=1 pytest -q tests/test_ranking_performance.py`
+- History API (integracion): `cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_history_api.py`
+- History performance smoke: `cd backend && RUN_API_INTEGRATION=1 RUN_PERF_TESTS=1 pytest -q tests/test_history_performance.py`
+- Analytics API (integracion): `cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_analytics_api.py`
+- Analytics performance smoke: `cd backend && RUN_API_INTEGRATION=1 RUN_PERF_TESTS=1 pytest -q tests/test_analytics_performance.py`
 
 ## Nota de seguridad
 Si en algun momento un secreto real se subio al repositorio, debes rotarlo inmediatamente.

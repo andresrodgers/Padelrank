@@ -24,4 +24,13 @@ class Settings(BaseSettings):
 
     ELO_K: int = 32
 
+    DB_POOL_SIZE: int = 10
+    DB_MAX_OVERFLOW: int = 20
+    DB_POOL_TIMEOUT_SECONDS: int = 30
+    DB_POOL_RECYCLE_SECONDS: int = 1800
+
+    API_WORKERS: int = 4
+    ALLOWED_HOSTS: str = "localhost,127.0.0.1"
+    SECURITY_HEADERS_ENABLED: bool = True
+
 settings = Settings()

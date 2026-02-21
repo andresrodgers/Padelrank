@@ -19,4 +19,20 @@ class UserProfile(Base):
     created_at: Mapped[sa.DateTime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()"))
     updated_at: Mapped[sa.DateTime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()"))
 
+    __table_args__ = (
+        sa.Index(
+            "ix_user_profiles_country_public_user",
+            "country",
+            "user_id",
+            postgresql_where=sa.text("is_public = true"),
+        ),
+        sa.Index(
+            "ix_user_profiles_country_city_public_user",
+            "country",
+            sa.text("lower(city)"),
+            "user_id",
+            postgresql_where=sa.text("is_public = true AND city IS NOT NULL"),
+        ),
+    )
+
     user = relationship("User", back_populates="profile")

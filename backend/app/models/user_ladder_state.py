@@ -19,5 +19,6 @@ class UserLadderState(Base):
 
     __table_args__ = (
         sa.Index("ix_user_ladder_rank", "ladder_code", "category_id", sa.text("rating DESC")),
+        sa.Index("ix_user_ladder_rank_full", "ladder_code", "category_id", sa.text("rating DESC"), sa.text("verified_matches DESC")),
         sa.Index("ix_user_ladder_user", "user_id"),
     )
