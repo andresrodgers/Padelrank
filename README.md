@@ -1,6 +1,37 @@
-# Padel Ranking MVP (Neiva)
+# Rivio Backend API (Padel Ranking MVP)
 
-Backend API para registro de partidos, confirmaciones y ranking de padel.
+Backend de Rivio para autenticacion, perfil de jugador, partidos, ranking, historial competitivo y analitica.
+
+Version actual de API/OpenAPI: `0.1.7`
+
+## Estado del proyecto (v0.1.7)
+
+### Implementado
+- Auth con `access_token` + `refresh_token` rotativo.
+- Registro/verificacion por OTP (entorno dev) + login por password.
+- Perfil de jugador completo (alias, genero, categoria, ubicacion, mano, lado, datos personales opcionales).
+- Avatar con presets y modo upload controlado por politica.
+- Elegibilidad de juego (`/me/play-eligibility`).
+- Partidos 4 jugadores, confirmacion por equipos y verificacion.
+- Ranking global/pais/ciudad con fuente unica en `user_ladder_state`.
+- Historial (timeline) auditable con filtros y paginacion.
+- Analitica materializada e incremental al verificar partidos.
+- Entitlements (`FREE` / `RIVIO_PLUS`) desacoplados de billing.
+- Soporte: `mailto` trazable + tickets in-app con control anti-spam.
+- Cuenta: `logout-all`, solicitud/cancelacion de eliminacion con ventana de gracia.
+- Billing scaffold (provider-agnostic) con:
+- checkout stub/store-managed base,
+- webhooks idempotentes,
+- validacion server-side App Store/Google Play (base),
+- reconciliacion periodica.
+
+### Pendiente (siguiente fase)
+- Conectores store al 100% productivo:
+- validacion criptografica nativa completa en notificaciones Apple/Google,
+- endurecimiento operativo final para produccion mobile.
+- Integracion de OTP con proveedor real (Twilio).
+
+---
 
 ## Stack
 - FastAPI
@@ -14,36 +45,38 @@ Backend API para registro de partidos, confirmaciones y ranking de padel.
 
 ## Configuracion
 1. Copia `.env.example` a `.env`.
-2. Define secretos reales fuera del repositorio:
+2. Define secretos reales fuera del repositorio.
+
+Minimo recomendado:
+- `DATABASE_URL`
 - `JWT_SECRET`
 - `OTP_PEPPER`
 
-`/.env` esta ignorado por git. No guardes secretos reales en commits.
+Billing/store (cuando se habilite en entornos reales):
+- `BILLING_PROVIDER` (`none|stripe|app_store|google_play|manual`)
+- `BILLING_PRODUCT_PLAN_MAP` (ejemplo: `rivio_plus_monthly=RIVIO_PLUS`)
+- App Store:
+- `APP_STORE_SHARED_SECRET`
+- Google Play:
+- `GOOGLE_PLAY_PACKAGE_NAME`
+- `GOOGLE_PLAY_SERVICE_ACCOUNT_EMAIL`
+- `GOOGLE_PLAY_SERVICE_ACCOUNT_PRIVATE_KEY_PEM`
+- Seguridad webhooks:
+- `BILLING_REQUIRE_WEBHOOK_SIGNATURE`
+- `BILLING_WEBHOOK_SECRET`
+- `BILLING_WEBHOOK_STRIPE_SECRET`
+- `BILLING_WEBHOOK_APP_STORE_SECRET`
+- `BILLING_WEBHOOK_GOOGLE_PLAY_SECRET`
 
-## Runtime tuning (escala backend)
-- `API_WORKERS` (default `2`): procesos de Uvicorn para concurrencia.
-- `DB_POOL_SIZE` / `DB_MAX_OVERFLOW`: tuning del pool SQLAlchemy por worker.
-- Defaults conservadores: `DB_POOL_SIZE=5`, `DB_MAX_OVERFLOW=5`.
-- Presupuesto recomendado: `API_WORKERS * (DB_POOL_SIZE + DB_MAX_OVERFLOW)` menor al limite real de conexiones de Postgres.
-- `DB_POOL_TIMEOUT_SECONDS` / `DB_POOL_RECYCLE_SECONDS`: estabilidad de conexiones.
+`/.env` esta ignorado por git.
 
-## Seguridad backend
-- `ENV` en backend es `prod` por defecto (seguro). Para desarrollo local usa `ENV=dev`.
-- `ALLOWED_HOSTS`: lista separada por comas para validar Host header.
-- `SECURITY_HEADERS_ENABLED=true`: activa headers de seguridad HTTP.
-- Retencion auth configurable por entorno:
-- `AUTH_OTP_RETENTION_DAYS`
-- `AUTH_LOGIN_ATTEMPTS_RETENTION_DAYS`
-- `USER_CONTACT_CHANGES_RETENTION_DAYS`
-- En produccion define `ALLOWED_HOSTS` con tus dominios reales (sin comodines globales).
-
-## Arranque (modo normal)
+## Arranque
 1. Levantar servicios:
 ```bash
 docker compose up -d db
 docker compose up --build -d api
 ```
-2. Ejecutar migraciones:
+2. Aplicar migraciones:
 ```bash
 docker compose run --rm api alembic upgrade head
 ```
@@ -51,124 +84,161 @@ docker compose run --rm api alembic upgrade head
 - API: `http://localhost:8000`
 - Docs: `http://localhost:8000/docs`
 
-## Arranque (modo desarrollo con autoreload)
-Usa el compose base + override dev:
+## Arranque dev con autoreload
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
-## Reglas de negocio relevantes
-- Un partido se crea con exactamente 4 participantes.
-- El creador del partido debe estar entre esos 4 participantes.
-- Cada equipo debe tener 2 participantes (`team_no` 1 y 2).
-- Ladders permitidos por genero:
-- `HM`: 4M
-- `WM`: 4F
-- `MX`: 2M + 2F
-- El creador queda confirmado al crear el partido.
-- El partido se verifica cuando hay confirmaciones de ambos equipos.
-- Si vence la ventana de confirmacion y sigue pendiente, el partido expira.
-- Ningun jugador puede crear/ser invitado si no cumple perfil minimo:
-- canal verificado (`phone` o `email`),
-- `alias`,
-- `gender`,
-- `category` en ladder correspondiente (o base).
+---
 
-## Diseno definitivo de auth (acceso app)
-- Identidades: `email` y/o `phone`.
-- OTP:
-- se usa para verificacion de registro y reset de password.
-- no se usa para login diario.
-- Login diario: `identifier (email|phone) + password`.
-- Tokens: `access_token` corto + `refresh_token`.
-- Refresh token rotativo:
-- cada refresh invalida el anterior.
-- en DB se guarda solo hash del refresh (`auth_sessions.refresh_hash`).
-- Logout: revoca sesion de refresh actual.
-- Password: hash con `bcrypt`.
-- Rate limit base:
-- OTP con cooldown de 2 minutos por contacto.
-- login con contador por `login_key_hash` en ventana de 15 minutos.
+## Modulos funcionales
 
-## Entidades de auth en DB
-- `users`
-- `auth_identities`
-- `auth_credentials`
-- `auth_sessions`
+### 1) Auth y seguridad
+- Identidades soportadas: `email` y/o `phone`.
+- OTP para registro y reset de password.
+- Login diario por `identifier + password`.
+- Refresh token rotativo con hash en DB.
+- `POST /auth/logout` y `POST /auth/logout-all`.
+- Headers de seguridad y validacion de `Host`.
 
-## Cambio de contacto (verificacion obligatoria)
-- `POST /me/contact-change/request`
-  - genera OTP para nuevo `email` o `telefono`.
-  - valida unicidad del contacto en `users` y `auth_identities`.
-- `POST /me/contact-change/confirm`
-  - requiere OTP valido.
-  - solo al confirmar se actualiza `users.email` o `users.phone_e164`.
-  - sincroniza y deja verificada la identidad en `auth_identities`.
+### 2) Perfil, elegibilidad y cuenta
+- `GET /me`, `PATCH /me/profile`, `GET /me/ladder-states`
+- `GET /me/play-eligibility`
+- Avatar:
+- `GET /me/avatar-presets`
+- `GET /me/avatar/upload-policy`
+- `POST /me/avatar/preset`
+- `POST /me/avatar/upload`
+- Ciclo de cuenta:
+- `POST /me/account/deletion-request`
+- `GET /me/account/deletion-status`
+- `POST /me/account/deletion-cancel`
 
-## Perfil minimo (`/me/play-eligibility`)
-- Debe cumplir:
-- `alias`
-- `gender` (`M|F|U`)
-- `category` por ladder correspondiente o base
-- `canal_verificado` (`phone_verified` o `email_verified`)
-- Si falta cualquiera:
-- no puede crear partido,
-- no puede ser invitado.
+### 3) Partidos
+- Creacion con 4 participantes y validaciones de composicion por ladder.
+- Confirmacion por jugadores.
+- Verificacion al confirmar ambos equipos.
+- Aplicacion atomica de ranking + analitica al verificar.
 
-## Perfil completo (enriquecido)
-- `country` (default `CO`)
-- `city`
-- `handedness` (`R|L|U`)
-- `preferred_side` (`drive|reves|both|U`)
-- `birthdate` (nullable)
-- `first_name` y `last_name` (nullable)
-- `first_name/last_name` NO bloquean partidos.
-- `country/city` NO bloquean partidos (si se usan para ranking/filtros).
+### 4) Ranking
+- Endpoint unico:
+- `GET /rankings/{ladder_code}/{category_id}`
+- Scopes:
+- Global (sin filtro)
+- Pais (`?country=CO`)
+- Ciudad (`?country=CO&city=Neiva`)
+- Fuente oficial de rating: `user_ladder_state` (sin duplicar ratings por ubicacion).
 
-## Ranking (global/pais/ciudad)
-- Endpoint unico: `GET /rankings/{ladder_code}/{category_id}`
-- Global: sin query params.
-- Pais: `?country=CO` (ISO-2).
-- Ciudad: `?country=CO&city=Neiva`.
-- El rating siempre sale de `user_ladder_state` (uno por `user + ladder + categoria`), sin duplicar por ubicacion.
+### 5) History (timeline auditable)
+- `GET /history/me`
+- `GET /history/users/{user_id}`
+- `GET /history/users/{user_id}/matches/{match_id}`
+- Filtros por ladder, rango de fechas, estado, club/ciudad.
+- Publico solo verificados; privado enmascara perfiles no publicos.
 
-## History (timeline auditable)
-- `GET /history/me`: timeline del usuario autenticado.
-- `GET /history/users/{user_id}`: timeline publico (solo verificados para terceros).
-- `GET /history/users/{user_id}/matches/{match_id}`: detalle auditable del evento.
-- Filtros: `ladder`, `date_from`, `date_to`, `state_scope`, `club_id`, `club_city`.
-- En vistas publicas, jugadores con perfil privado aparecen enmascarados como `[private]`.
+### 6) Analytics (read model materializado)
+- `GET /analytics/me`
+- `GET /analytics/me/dashboard`
+- `GET /analytics/users/{user_id}`
+- `GET /analytics/users/{user_id}/dashboard`
+- Export premium:
+- `GET /analytics/me/export` (solo `RIVIO_PLUS`)
 
-## Analytics (read model materializado)
-- `GET /analytics/me`: metricas privadas por ladder.
-- `GET /analytics/users/{user_id}`: metricas publicas (si perfil publico).
-- Se actualiza incrementalmente cuando un partido pasa a `verified`.
-- Es idempotente por `(user_id, match_id)` para evitar dobles conteos.
-- Rebuild completo (admin/internal): `cd backend && python scripts/rebuild_analytics.py`.
+### 7) Entitlements (Rivio / Rivio+)
+- `GET /entitlements/me`
+- `GET /entitlements/plans`
+- `POST /entitlements/me/simulate` (solo dev)
 
-## Mantenimiento operativo (auth)
-- Limpieza de artefactos antiguos:
-- `cd backend && python scripts/cleanup_auth_artifacts.py`
-- Recomendada su ejecucion periodica (cron o scheduler interno).
+### 8) Soporte
+- `GET /support/contact` (mailto trazable)
+- `POST /support/tickets`
+- `GET /support/tickets/me`
 
-## CI
-El workflow de GitHub Actions ahora:
+### 9) Billing (store-managed base)
+- `GET /billing/me`
+- `POST /billing/checkout-session`
+- `POST /billing/webhooks/{provider}`
+- `POST /billing/store/app-store/validate`
+- `POST /billing/store/google-play/validate`
+- `POST /billing/simulate/subscription` (solo dev)
+- `POST /billing/reconcile` (solo dev)
+
+---
+
+## Scripts operativos
+- Rebuild de analitica:
+```bash
+cd backend && python scripts/rebuild_analytics.py
+```
+- Limpieza de artefactos auth:
+```bash
+cd backend && python scripts/cleanup_auth_artifacts.py
+```
+- Procesar eliminaciones de cuenta programadas:
+```bash
+cd backend && python scripts/process_account_deletions.py
+```
+- Reconciliar billing de tiendas:
+```bash
+cd backend && python scripts/reconcile_billing.py
+```
+
+---
+
+## CI y tests
+
+El workflow CI:
 1. Levanta Postgres de servicio.
 2. Ejecuta `alembic upgrade head`.
-3. Valida imports.
-4. Levanta la API (`uvicorn`) y espera `/health`.
-5. Corre tests con integracion habilitada (`RUN_API_INTEGRATION=1 pytest -q`).
+3. Levanta API y valida `/health`.
+4. Corre tests con integracion habilitada.
 
-## Tests (unificados)
+Suite actual:
 - Carpeta unica: `backend/tests`
-- Unit tests: `cd backend && pytest -q`
-- Regresion minima core (Ranking/History/Analytics): `cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_regression_core_modules.py`
-- Integracion API (requiere API arriba): `cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_api_integration.py`
-- Performance smoke (opcional): `cd backend && RUN_API_INTEGRATION=1 RUN_PERF_TESTS=1 pytest -q tests/test_ranking_performance.py`
-- History API (integracion): `cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_history_api.py`
-- History performance smoke: `cd backend && RUN_API_INTEGRATION=1 RUN_PERF_TESTS=1 pytest -q tests/test_history_performance.py`
-- Analytics API (integracion): `cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_analytics_api.py`
-- Analytics performance smoke: `cd backend && RUN_API_INTEGRATION=1 RUN_PERF_TESTS=1 pytest -q tests/test_analytics_performance.py`
+- Ejecucion completa:
+```bash
+cd backend && RUN_API_INTEGRATION=1 pytest -q tests
+```
 
-## Nota de seguridad
-Si en algun momento un secreto real se subio al repositorio, debes rotarlo inmediatamente.
+Smokes utiles:
+- Core regression:
+```bash
+cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_regression_core_modules.py
+```
+- Billing:
+```bash
+cd backend && RUN_API_INTEGRATION=1 pytest -q tests/test_billing_api.py
+```
+
+---
+
+## Arquitectura de datos (resumen)
+- Rating oficial por jugador/ladder/categoria:
+- `user_ladder_state`
+- Timeline de partidos:
+- `matches`, `match_participants`, `match_confirmations`, `match_scores`
+- Read model de analitica:
+- `user_analytics_state`, `user_analytics_match_applied`, `user_analytics_partner_stats`, `user_analytics_rival_stats`
+- Entitlements y planes:
+- `user_entitlements`
+- Soporte:
+- `support_tickets`
+- Billing:
+- `billing_customers`, `billing_subscriptions`, `billing_webhook_events`, `billing_checkout_sessions`
+
+---
+
+## Seguridad y operacion
+- No subir secretos reales al repositorio.
+- Rotar secretos si hubo exposicion.
+- Definir `ALLOWED_HOSTS` reales en produccion.
+- Ejecutar tareas periodicas de mantenimiento:
+- cleanup auth,
+- reconciliacion billing,
+- procesamiento de eliminaciones programadas.
+
+---
+
+## Releases
+- Ultimo tag estable publicado: `v0.1.7`
+- Rama de referencia actual: `main`
