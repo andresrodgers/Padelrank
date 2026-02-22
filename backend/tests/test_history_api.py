@@ -56,6 +56,65 @@ def test_history_me_verified_pending_filters(api, identity_factory):
     assert {r["match_id"] for r in ladder_rows} == all_ids
 
 
+def test_history_me_cursor_pagination(api, identity_factory):
+    users = _build_mx_users(api, identity_factory, "hist_cursor")
+    focus = users[0]
+
+    played_times = [
+        (datetime.now(timezone.utc) - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    ]
+    created_ids: list[str] = []
+    for played_at in played_times:
+        m = create_match(
+            api,
+            focus["token"],
+            u1=users[0],
+            u2=users[1],
+            u3=users[2],
+            u4=users[3],
+            played_at=played_at,
+        )
+        confirm_match(api, users[1]["token"], m["id"])
+        created_ids.append(m["id"])
+
+    page1 = api.call("GET", "/history/me?state_scope=verified&limit=1", token=focus["token"])
+    assert len(page1["rows"]) == 1
+    assert page1["next_cursor"] is not None
+
+    page2 = api.call(
+        "GET",
+        f"/history/me?state_scope=verified&limit=1&cursor={page1['next_cursor']}",
+        token=focus["token"],
+    )
+    assert len(page2["rows"]) == 1
+    assert page2["rows"][0]["match_id"] != page1["rows"][0]["match_id"]
+
+    seen = {page1["rows"][0]["match_id"], page2["rows"][0]["match_id"]}
+    cursor = page2["next_cursor"]
+    while cursor is not None:
+        nxt = api.call(
+            "GET",
+            f"/history/me?state_scope=verified&limit=1&cursor={cursor}",
+            token=focus["token"],
+        )
+        if not nxt["rows"]:
+            break
+        seen.add(nxt["rows"][0]["match_id"])
+        cursor = nxt["next_cursor"]
+
+    assert set(created_ids).issubset(seen)
+
+    with pytest.raises(ApiError) as mixed_err:
+        api.call(
+            "GET",
+            f"/history/me?state_scope=verified&limit=1&offset=1&cursor={page1['next_cursor']}",
+            token=focus["token"],
+        )
+    assert mixed_err.value.status_code == 400
+
+
 def test_history_user_visibility_and_scope(api, identity_factory):
     users = _build_mx_users(api, identity_factory, "hist_pub")
     focus = users[0]

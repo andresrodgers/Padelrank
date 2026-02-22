@@ -5,6 +5,7 @@ import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.api.deps import get_current_user
 from app.core.config import settings
 from app.core.security import (
     create_access_token_for_session,
@@ -262,8 +263,8 @@ def register_complete(payload: RegisterCompleteIn, db: Session = Depends(get_db)
         for attempt in range(20):
             alias = base_alias if attempt == 0 else f"{base_alias}_{uuid4().hex[:6]}"
             row = db.execute(sa.text("""
-                INSERT INTO user_profiles (user_id, alias, gender, is_public)
-                VALUES (:u, :a, 'U', true)
+                INSERT INTO user_profiles (user_id, alias, gender, is_public, avatar_mode, avatar_preset_key)
+                VALUES (:u, :a, 'U', true, 'preset', 'default_1')
                 ON CONFLICT DO NOTHING
                 RETURNING 1
             """), {"u": user_id, "a": alias}).first()
@@ -272,6 +273,12 @@ def register_complete(payload: RegisterCompleteIn, db: Session = Depends(get_db)
                 break
         if not inserted:
             raise HTTPException(409, "No se pudo asignar un alias de perfil")
+
+    db.execute(sa.text("""
+        INSERT INTO user_entitlements (user_id, plan_code, ads_enabled)
+        VALUES (:u, 'FREE', true)
+        ON CONFLICT (user_id) DO NOTHING
+    """), {"u": user_id})
 
     tokens = _create_session_tokens(db, user_id)
     audit(db, user_id, "auth", str(user_id), "register_completed", {"contact_kind": contact_kind})
@@ -433,4 +440,22 @@ def logout(payload: LogoutIn, db: Session = Depends(get_db)):
                 WHERE id=:sid
             """), {"sid": sid})
             db.commit()
+    return SimpleOKOut(ok=True)
+
+
+@router.post("/logout-all", response_model=SimpleOKOut)
+def logout_all(current=Depends(get_current_user), db: Session = Depends(get_db)):
+    db.execute(
+        sa.text(
+            """
+            UPDATE auth_sessions
+            SET revoked_at=now(), revoked_reason='logout_all'
+            WHERE user_id=:u
+              AND revoked_at IS NULL
+            """
+        ),
+        {"u": str(current.id)},
+    )
+    audit(db, current.id, "auth", str(current.id), "logout_all", {})
+    db.commit()
     return SimpleOKOut(ok=True)

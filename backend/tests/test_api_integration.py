@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from urllib import error, request
 
 import pytest
@@ -212,3 +213,11 @@ def test_health_security_headers_and_trusted_host(api):
     with pytest.raises(error.HTTPError) as invalid_host:
         request.urlopen(bad_host_req, timeout=10)
     assert invalid_host.value.code == 400
+
+
+def test_openapi_version_matches_release(api):
+    req = request.Request(url=f"{api.base_url}/openapi.json", method="GET")
+    with request.urlopen(req, timeout=10) as resp:
+        assert resp.status == 200
+        payload = json.loads(resp.read().decode("utf-8"))
+    assert payload.get("info", {}).get("version") == "0.1.6"

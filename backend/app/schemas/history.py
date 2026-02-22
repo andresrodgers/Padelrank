@@ -34,6 +34,7 @@ class HistoryTimelineOut(BaseModel):
     limit: int
     offset: int
     next_offset: int | None
+    next_cursor: str | None = None
 
 
 class HistoryParticipantOut(BaseModel):

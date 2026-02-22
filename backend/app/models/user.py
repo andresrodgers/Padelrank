@@ -12,4 +12,8 @@ class User(Base):
     created_at: Mapped[sa.DateTime] = mapped_column(sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()"))
     last_login_at: Mapped[sa.DateTime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
 
+    __table_args__ = (
+        sa.CheckConstraint("status in ('active','blocked','pending_deletion','deleted')", name="ck_user_status"),
+    )
+
     profile = relationship("UserProfile", back_populates="user", uselist=False, cascade="all, delete-orphan")

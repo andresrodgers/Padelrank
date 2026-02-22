@@ -1,13 +1,16 @@
 from datetime import timedelta
+from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
-from app.api.deps import get_current_user
+from app.api.deps import get_authenticated_user, get_current_user
 from app.core.config import settings
 from app.core.security import now_utc, otp_hash, pii_hash, random_otp_code
 from app.db.session import get_db
+from app.schemas.account import AccountDeletionActionOut, AccountDeletionRequestIn, AccountDeletionStatusOut
+from app.schemas.avatar import AvatarOut, AvatarPresetOut, AvatarSetPresetIn, AvatarSetUploadIn, AvatarUploadPolicyOut
 from app.schemas.me import (
     MeOut,
     ProfileOut,
@@ -51,6 +54,125 @@ def _resolve_contact(phone_e164: str | None, country_code: str | None, phone_num
     if email:
         return ("email", _normalize_email(email))
     return ("phone", _normalize_phone(phone_e164, country_code, phone_number))
+
+
+def _csv_values(raw: str) -> list[str]:
+    return [v.strip().lower() for v in raw.split(",") if v.strip()]
+
+
+def _avatar_allowed_hosts() -> set[str]:
+    return set(_csv_values(settings.AVATAR_UPLOAD_ALLOWED_HOSTS))
+
+
+def _avatar_allowed_exts() -> set[str]:
+    return set(_csv_values(settings.AVATAR_UPLOAD_ALLOWED_EXT))
+
+
+def _build_avatar_upload_policy() -> AvatarUploadPolicyOut:
+    return AvatarUploadPolicyOut(
+        enabled=bool(settings.AVATAR_UPLOAD_ENABLED),
+        max_size_mb=int(settings.AVATAR_UPLOAD_MAX_SIZE_MB),
+        allowed_extensions=sorted(_avatar_allowed_exts()),
+        allowed_hosts=sorted(_avatar_allowed_hosts()),
+        requires_signed_urls=True,
+    )
+
+
+def _profile_query_row(db: Session, user_id: str):
+    return db.execute(
+        sa.text(
+            """
+            SELECT
+                p.alias,
+                p.gender,
+                p.is_public,
+                p.country,
+                p.city,
+                p.handedness,
+                p.preferred_side,
+                p.birthdate,
+                p.first_name,
+                p.last_name,
+                p.avatar_mode,
+                p.avatar_preset_key,
+                p.avatar_url,
+                ap.image_url AS avatar_preset_image_url
+            FROM user_profiles p
+            LEFT JOIN avatar_presets ap
+                ON ap.key = p.avatar_preset_key
+            WHERE p.user_id=:u
+            """
+        ),
+        {"u": user_id},
+    ).mappings().first()
+
+
+def _profile_out_from_row(prof) -> ProfileOut | None:
+    if not prof:
+        return None
+    payload = dict(prof)
+    mode = payload.get("avatar_mode") or "preset"
+    avatar_image = payload.get("avatar_url") if mode == "upload" else payload.get("avatar_preset_image_url")
+    payload["avatar_image_url"] = avatar_image
+    payload.pop("avatar_preset_image_url", None)
+    return ProfileOut(**payload)
+
+
+def _load_avatar(db: Session, user_id: str) -> AvatarOut:
+    row = _profile_query_row(db, user_id)
+    if not row:
+        raise HTTPException(400, "Perfil no encontrado")
+    mode = str(row.get("avatar_mode") or "preset")
+    resolved = row["avatar_url"] if mode == "upload" else row["avatar_preset_image_url"]
+    return AvatarOut(
+        mode=mode,  # type: ignore[arg-type]
+        preset_key=row["avatar_preset_key"],
+        avatar_url=row["avatar_url"],
+        resolved_image_url=resolved,
+    )
+
+
+def _latest_deletion_request(db: Session, user_id: str, lock: bool = False):
+    suffix = " FOR UPDATE" if lock else ""
+    return db.execute(
+        sa.text(
+            f"""
+            SELECT
+                id::text AS id,
+                reason,
+                requested_at,
+                scheduled_for,
+                cancelled_at,
+                executed_at
+            FROM account_deletion_requests
+            WHERE user_id=:u
+            ORDER BY requested_at DESC, id DESC
+            LIMIT 1{suffix}
+            """
+        ),
+        {"u": user_id},
+    ).mappings().first()
+
+
+def _serialize_deletion_status(row) -> AccountDeletionStatusOut:
+    if not row:
+        return AccountDeletionStatusOut(status="none", grace_days=int(settings.ACCOUNT_DELETION_GRACE_DAYS))
+    if row["executed_at"] is not None:
+        status = "executed"
+    elif row["cancelled_at"] is not None:
+        status = "cancelled"
+    else:
+        status = "scheduled"
+    return AccountDeletionStatusOut(
+        status=status,  # type: ignore[arg-type]
+        reason=row["reason"],
+        requested_at=row["requested_at"],
+        scheduled_for=row["scheduled_for"],
+        cancelled_at=row["cancelled_at"],
+        executed_at=row["executed_at"],
+        grace_days=int(settings.ACCOUNT_DELETION_GRACE_DAYS),
+    )
+
 
 def _identity_in_use_by_other(db: Session, user_id: str, contact_kind: str, contact_value: str) -> bool:
     row = db.execute(sa.text("""
@@ -158,13 +280,8 @@ def _upsert_ladder_state(db: Session, user_id, ladder_code: str, category_id: st
 
 @router.get("", response_model=MeOut)
 def me(current=Depends(get_current_user), db: Session = Depends(get_db)):
-    prof = db.execute(sa.text("""
-        SELECT alias, gender, is_public, country, city, handedness, preferred_side, birthdate, first_name, last_name
-        FROM user_profiles
-        WHERE user_id=:u
-    """), {"u": current.id}).mappings().first()
-
-    profile = ProfileOut(**prof) if prof else None
+    prof = _profile_query_row(db, str(current.id))
+    profile = _profile_out_from_row(prof)
     return MeOut(
         id=str(current.id),
         phone_e164=current.phone_e164,
@@ -172,6 +289,260 @@ def me(current=Depends(get_current_user), db: Session = Depends(get_db)):
         status=current.status,
         profile=profile,
     )
+
+
+@router.get("/avatar-presets", response_model=list[AvatarPresetOut])
+def avatar_presets(current=Depends(get_current_user), db: Session = Depends(get_db)):
+    rows = db.execute(
+        sa.text(
+            """
+            SELECT key, display_name, image_url, sort_order
+            FROM avatar_presets
+            WHERE is_active=true
+            ORDER BY sort_order, key
+            """
+        )
+    ).mappings().all()
+    return [AvatarPresetOut(**r) for r in rows]
+
+
+@router.get("/avatar/upload-policy", response_model=AvatarUploadPolicyOut)
+def avatar_upload_policy(current=Depends(get_current_user)):
+    return _build_avatar_upload_policy()
+
+
+@router.post("/avatar/preset", response_model=AvatarOut)
+def set_avatar_preset(payload: AvatarSetPresetIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
+    preset = db.execute(
+        sa.text(
+            """
+            SELECT key
+            FROM avatar_presets
+            WHERE key=:k AND is_active=true
+            """
+        ),
+        {"k": payload.preset_key},
+    ).mappings().first()
+    if not preset:
+        raise HTTPException(400, "Preset de avatar invalido")
+
+    db.execute(
+        sa.text(
+            """
+            UPDATE user_profiles
+            SET avatar_mode='preset',
+                avatar_preset_key=:k,
+                avatar_url=NULL,
+                updated_at=now()
+            WHERE user_id=:u
+            """
+        ),
+        {"u": str(current.id), "k": payload.preset_key},
+    )
+    audit(
+        db,
+        current.id,
+        "avatar",
+        str(current.id),
+        "preset_selected",
+        {"preset_key": payload.preset_key},
+    )
+    out = _load_avatar(db, str(current.id))
+    db.commit()
+    return out
+
+
+@router.post("/avatar/upload", response_model=AvatarOut)
+def set_avatar_upload(payload: AvatarSetUploadIn, current=Depends(get_current_user), db: Session = Depends(get_db)):
+    policy = _build_avatar_upload_policy()
+    if not policy.enabled:
+        raise HTTPException(503, "Carga de avatar no configurada")
+
+    raw = payload.avatar_url.strip()
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        raise HTTPException(400, "avatar_url debe ser https")
+
+    host = parsed.hostname.lower()
+    if policy.allowed_hosts and host not in policy.allowed_hosts:
+        raise HTTPException(400, "Host de avatar no permitido")
+
+    if "." not in parsed.path:
+        raise HTTPException(400, "avatar_url debe incluir extension")
+    ext = parsed.path.rsplit(".", 1)[-1].lower()
+    if policy.allowed_extensions and ext not in policy.allowed_extensions:
+        raise HTTPException(400, "Extension de avatar no permitida")
+
+    db.execute(
+        sa.text(
+            """
+            UPDATE user_profiles
+            SET avatar_mode='upload',
+                avatar_preset_key=NULL,
+                avatar_url=:url,
+                updated_at=now()
+            WHERE user_id=:u
+            """
+        ),
+        {"u": str(current.id), "url": raw},
+    )
+    audit(
+        db,
+        current.id,
+        "avatar",
+        str(current.id),
+        "upload_selected",
+        {"host": host, "ext": ext},
+    )
+    out = _load_avatar(db, str(current.id))
+    db.commit()
+    return out
+
+
+@router.get("/account/deletion-status", response_model=AccountDeletionStatusOut)
+def account_deletion_status(current=Depends(get_authenticated_user), db: Session = Depends(get_db)):
+    row = _latest_deletion_request(db, str(current.id))
+    return _serialize_deletion_status(row)
+
+
+@router.post("/account/deletion-request", response_model=AccountDeletionActionOut)
+def request_account_deletion(
+    payload: AccountDeletionRequestIn,
+    current=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    open_row = db.execute(
+        sa.text(
+            """
+            SELECT id::text AS id
+            FROM account_deletion_requests
+            WHERE user_id=:u
+              AND cancelled_at IS NULL
+              AND executed_at IS NULL
+            ORDER BY requested_at DESC, id DESC
+            LIMIT 1
+            FOR UPDATE
+            """
+        ),
+        {"u": str(current.id)},
+    ).mappings().first()
+    if open_row:
+        raise HTTPException(409, "Ya tienes una eliminacion de cuenta programada")
+
+    row = db.execute(
+        sa.text(
+            """
+            INSERT INTO account_deletion_requests (user_id, reason, scheduled_for, created_by)
+            VALUES (:u, :reason, (now() + make_interval(days => :days)), 'self')
+            RETURNING
+                id::text AS id,
+                reason,
+                requested_at,
+                scheduled_for,
+                cancelled_at,
+                executed_at
+            """
+        ),
+        {
+            "u": str(current.id),
+            "reason": payload.reason.strip() if payload.reason else None,
+            "days": int(settings.ACCOUNT_DELETION_GRACE_DAYS),
+        },
+    ).mappings().one()
+
+    db.execute(
+        sa.text(
+            """
+            UPDATE users
+            SET status='pending_deletion'
+            WHERE id=:u
+            """
+        ),
+        {"u": str(current.id)},
+    )
+    db.execute(
+        sa.text(
+            """
+            UPDATE auth_sessions
+            SET revoked_at=now(), revoked_reason='account_deletion_requested'
+            WHERE user_id=:u
+              AND revoked_at IS NULL
+            """
+        ),
+        {"u": str(current.id)},
+    )
+    audit(
+        db,
+        current.id,
+        "account",
+        str(current.id),
+        "deletion_requested",
+        {"grace_days": int(settings.ACCOUNT_DELETION_GRACE_DAYS)},
+    )
+    db.commit()
+    status = _serialize_deletion_status(row)
+    return AccountDeletionActionOut(
+        ok=True,
+        detail=f"Cuenta marcada para eliminacion en {settings.ACCOUNT_DELETION_GRACE_DAYS} dias",
+        deletion=status,
+    )
+
+
+@router.post("/account/deletion-cancel", response_model=AccountDeletionActionOut)
+def cancel_account_deletion(current=Depends(get_authenticated_user), db: Session = Depends(get_db)):
+    row = db.execute(
+        sa.text(
+            """
+            SELECT
+                id::text AS id,
+                reason,
+                requested_at,
+                scheduled_for,
+                cancelled_at,
+                executed_at
+            FROM account_deletion_requests
+            WHERE user_id=:u
+              AND cancelled_at IS NULL
+              AND executed_at IS NULL
+            ORDER BY requested_at DESC, id DESC
+            LIMIT 1
+            FOR UPDATE
+            """
+        ),
+        {"u": str(current.id)},
+    ).mappings().first()
+    if not row:
+        raise HTTPException(404, "No hay una eliminacion programada para cancelar")
+
+    db.execute(
+        sa.text(
+            """
+            UPDATE account_deletion_requests
+            SET cancelled_at=now()
+            WHERE id=:id
+            """
+        ),
+        {"id": row["id"]},
+    )
+    db.execute(
+        sa.text(
+            """
+            UPDATE users
+            SET status='active'
+            WHERE id=:u
+            """
+        ),
+        {"u": str(current.id)},
+    )
+    audit(db, current.id, "account", str(current.id), "deletion_cancelled", {})
+    refreshed = _latest_deletion_request(db, str(current.id))
+    db.commit()
+    return AccountDeletionActionOut(
+        ok=True,
+        detail="Eliminacion de cuenta cancelada",
+        deletion=_serialize_deletion_status(refreshed),
+    )
+
 
 @router.post("/contact-change/request", response_model=ContactChangeRequestOut)
 def request_contact_change(payload: ContactChangeRequestIn, current=Depends(get_current_user), db: Session = Depends(get_db)):

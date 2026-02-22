@@ -13,6 +13,10 @@ class ProfileOut(BaseModel):
     birthdate: date | None = None
     first_name: str | None = None
     last_name: str | None = None
+    avatar_mode: Literal["preset", "upload"] = "preset"
+    avatar_preset_key: str | None = None
+    avatar_url: str | None = None
+    avatar_image_url: str | None = None
 
 class MeOut(BaseModel):
     id: str

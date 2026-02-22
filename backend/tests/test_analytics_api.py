@@ -48,6 +48,32 @@ def test_analytics_incremental_and_idempotent_guard(api, identity_factory):
     assert me_rows_after[0]["total_verified_matches"] == 1
 
 
+def test_verify_hook_updates_ranking_and_analytics_atomically(api, identity_factory):
+    users = _build_mx_users(api, identity_factory, "ana_hook")
+    focus = users[0]
+
+    match = create_match(api, focus["token"], u1=users[0], u2=users[1], u3=users[2], u4=users[3])
+    confirm_match(api, users[1]["token"], match["id"])
+
+    detail = api.call("GET", f"/matches/{match['id']}/detail", token=focus["token"])
+    assert detail["status"] == "verified"
+
+    history_rows = api.call("GET", "/history/me?state_scope=verified&limit=20", token=focus["token"])["rows"]
+    event = next(r for r in history_rows if r["match_id"] == match["id"])
+    assert event["ranking_impact"] is True
+    assert event["ranking_impact_reason"] == "verified_and_processed"
+
+    analytics_rows = api.call("GET", "/analytics/me?ladder=MX", token=focus["token"])
+    assert len(analytics_rows) == 1
+    assert analytics_rows[0]["total_verified_matches"] == 1
+    assert analytics_rows[0]["wins"] == 1
+
+    ladder_states = api.call("GET", "/me/ladder-states", token=focus["token"])
+    mx_state = next(row for row in ladder_states if row["ladder_code"] == "MX")
+    assert mx_state["verified_matches"] >= 1
+    assert int(mx_state["rating"]) > 1000
+
+
 def test_analytics_recent_trend_and_public_visibility(api, identity_factory):
     users = _build_mx_users(api, identity_factory, "ana_vis")
     focus = users[0]

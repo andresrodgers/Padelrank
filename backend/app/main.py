@@ -7,7 +7,7 @@ from app.api.router import router
 
 app = FastAPI(
     title="Padel Ranking MVP (Neiva)",
-    version="0.1.0",
+    version="0.1.6",
 )
 
 allowed_hosts = [h.strip() for h in settings.ALLOWED_HOSTS.split(",") if h.strip()]

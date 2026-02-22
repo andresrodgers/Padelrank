@@ -1,4 +1,6 @@
-from datetime import date
+import base64
+from datetime import date, datetime
+import json
 from typing import Literal
 from uuid import UUID
 
@@ -47,6 +49,28 @@ CASE
   ELSE 'unknown'
 END
 """
+
+
+def _encode_timeline_cursor(*, played_at: datetime, match_id: str) -> str:
+    payload = {
+        "played_at": played_at.isoformat(),
+        "match_id": match_id,
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_timeline_cursor(raw: str) -> tuple[datetime, str]:
+    try:
+        data = base64.urlsafe_b64decode(raw.encode("ascii"))
+        payload = json.loads(data.decode("utf-8"))
+        played_at_raw = payload["played_at"]
+        match_id_raw = payload["match_id"]
+        played_at = datetime.fromisoformat(played_at_raw)
+        match_id = str(UUID(match_id_raw))
+        return played_at, match_id
+    except Exception:
+        raise HTTPException(400, "cursor invalido")
 
 
 def _normalize_uuid(raw: str, name: str) -> str:
@@ -105,6 +129,7 @@ def _query_timeline(
     club_city: str | None,
     limit: int,
     offset: int,
+    cursor: str | None = None,
     match_id: str | None = None,
 ):
     is_public_view = visibility_reason == "public_verified_history"
@@ -129,6 +154,18 @@ def _query_timeline(
         "limit": limit,
         "offset": offset,
     }
+    if cursor is not None:
+        if offset != 0:
+            raise HTTPException(400, "offset debe ser 0 cuando se usa cursor")
+        cursor_played_at, cursor_match_id = _decode_timeline_cursor(cursor)
+        where.append("""
+            (
+                m.played_at < :cursor_played_at
+                OR (m.played_at = :cursor_played_at AND m.id < CAST(:cursor_match_id AS uuid))
+            )
+        """)
+        params["cursor_played_at"] = cursor_played_at
+        params["cursor_match_id"] = cursor_match_id
 
     if ladder is not None:
         where.append("m.ladder_code=:ladder")
@@ -203,7 +240,7 @@ def _query_timeline(
         LEFT JOIN match_scores ms ON ms.match_id = m.id
         LEFT JOIN user_profiles cp ON cp.user_id = m.created_by
         WHERE {" AND ".join(where)}
-        ORDER BY m.played_at DESC, m.created_at DESC
+        ORDER BY m.played_at DESC, m.id DESC
         LIMIT :limit OFFSET :offset
     """), params).mappings().all()
 
@@ -216,8 +253,12 @@ def _query_timeline(
         )
         for r in rows
     ]
-    next_offset = (offset + limit) if len(out_rows) == limit else None
-    return out_rows, next_offset
+    next_offset = (offset + limit) if (len(out_rows) == limit and cursor is None and match_id is None) else None
+    next_cursor = None
+    if len(out_rows) == limit and match_id is None:
+        tail = out_rows[-1]
+        next_cursor = _encode_timeline_cursor(played_at=tail.played_at, match_id=tail.match_id)
+    return out_rows, next_offset, next_cursor
 
 
 @router.get("/me", response_model=HistoryTimelineOut)
@@ -230,13 +271,14 @@ def history_me(
     club_city: str | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    cursor: str | None = Query(default=None),
     current=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     if date_from and date_to and date_from > date_to:
         raise HTTPException(400, "date_from no puede ser mayor que date_to")
 
-    rows, next_offset = _query_timeline(
+    rows, next_offset, next_cursor = _query_timeline(
         db,
         target_user_id=str(current.id),
         visibility_reason="self_participant",
@@ -248,6 +290,7 @@ def history_me(
         club_city=club_city,
         limit=limit,
         offset=offset,
+        cursor=cursor,
     )
     return HistoryTimelineOut(
         target_user_id=str(current.id),
@@ -255,6 +298,7 @@ def history_me(
         limit=limit,
         offset=offset,
         next_offset=next_offset,
+        next_cursor=next_cursor,
     )
 
 
@@ -269,6 +313,7 @@ def history_user(
     club_city: str | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    cursor: str | None = Query(default=None),
     current=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -285,7 +330,7 @@ def history_user(
     effective_scope = _resolve_timeline_scope(state_scope, is_self)
     visibility_reason = "self_participant" if is_self else "public_verified_history"
 
-    rows, next_offset = _query_timeline(
+    rows, next_offset, next_cursor = _query_timeline(
         db,
         target_user_id=target_user_id,
         visibility_reason=visibility_reason,
@@ -297,6 +342,7 @@ def history_user(
         club_city=club_city,
         limit=limit,
         offset=offset,
+        cursor=cursor,
     )
     return HistoryTimelineOut(
         target_user_id=target_user_id,
@@ -304,6 +350,7 @@ def history_user(
         limit=limit,
         offset=offset,
         next_offset=next_offset,
+        next_cursor=next_cursor,
     )
 
 
@@ -322,7 +369,7 @@ def history_match_detail(
 
     visibility_reason = "self_participant" if is_self else "public_verified_history"
     state_scope: Literal["verified", "pending", "all"] = "all" if is_self else "verified"
-    rows, _ = _query_timeline(
+    rows, _, _ = _query_timeline(
         db,
         target_user_id=target_user_id,
         visibility_reason=visibility_reason,
