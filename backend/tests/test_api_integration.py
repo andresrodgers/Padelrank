@@ -220,4 +220,4 @@ def test_openapi_version_matches_release(api):
     with request.urlopen(req, timeout=10) as resp:
         assert resp.status == 200
         payload = json.loads(resp.read().decode("utf-8"))
-    assert payload.get("info", {}).get("version") == "0.1.6"
+    assert payload.get("info", {}).get("version") == "0.1.7"

@@ -10,7 +10,13 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.security import now_utc
 from app.services.audit import audit
-from app.services.billing_provider import CheckoutSessionRequest, get_provider_adapter
+from app.services.billing_provider import (
+    CheckoutSessionRequest,
+    get_provider_adapter,
+    normalize_provider_webhook_payload,
+    validate_app_store_receipt,
+    validate_google_play_purchase,
+)
 
 VALID_PROVIDERS = {"none", "stripe", "app_store", "google_play", "manual"}
 VALID_SUBSCRIPTION_STATUS = {"trialing", "active", "past_due", "canceled", "incomplete", "incomplete_expired", "unpaid"}
@@ -73,6 +79,31 @@ def _entitlement_from_subscription(plan_code: str, status: str, current_period_e
     if plan_code == settings.BILLING_PLUS_PLAN_CODE and status in ENTITLES_PLUS_STATUSES:
         return ("RIVIO_PLUS", False, current_period_end)
     return ("FREE", True, None)
+
+
+def _product_plan_map() -> dict[str, str]:
+    out: dict[str, str] = {}
+    raw = (settings.BILLING_PRODUCT_PLAN_MAP or "").strip()
+    if not raw:
+        return out
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    for item in parts:
+        sep = "=" if "=" in item else ":"
+        if sep not in item:
+            continue
+        product_id, plan_code = [x.strip() for x in item.split(sep, 1)]
+        plan = _normalize_plan_code(plan_code)
+        if product_id:
+            out[product_id] = plan
+    return out
+
+
+def resolve_plan_code_from_product(product_id: str) -> str:
+    mapping = _product_plan_map()
+    plan = mapping.get(product_id)
+    if not plan:
+        raise ValueError(f"product_id '{product_id}' no mapeado. Configura BILLING_PRODUCT_PLAN_MAP")
+    return plan
 
 
 def _upsert_customer(
@@ -211,8 +242,14 @@ def create_checkout_session_stub(
         cancel_url=cancel_url,
     )
 
-    if provider == "none":
+    if provider in {"none", "app_store", "google_play"}:
         expires_at = now_utc() + timedelta(minutes=30)
+        is_store_managed = provider in {"app_store", "google_play"}
+        detail = (
+            "Compra administrada por tienda: usa validacion server-side de App Store/Google Play."
+            if is_store_managed
+            else "Billing provider no configurado. Checkout en modo stub."
+        )
         row = db.execute(
             sa.text(
                 """
@@ -258,7 +295,7 @@ def create_checkout_session_stub(
             "status": row["status"],
             "checkout_url": None,
             "is_stub": True,
-            "detail": "Billing provider no configurado. Checkout en modo stub.",
+            "detail": detail,
             "expires_at": row["expires_at"],
         }
 
@@ -368,6 +405,7 @@ def _extract_user_subscription_data(payload: dict) -> dict[str, object]:
     user_id = _try_uuid(data.get("user_id"))
     provider_customer_id = data.get("provider_customer_id")
     provider_subscription_id = str(data.get("provider_subscription_id") or "")
+    product_id = str(data.get("product_id") or "")
     plan_code = str(data.get("plan_code") or "FREE")
     status = str(data.get("status") or "incomplete")
     cancel_at_period_end = bool(data.get("cancel_at_period_end") or False)
@@ -377,6 +415,7 @@ def _extract_user_subscription_data(payload: dict) -> dict[str, object]:
         "user_id": user_id,
         "provider_customer_id": str(provider_customer_id) if provider_customer_id else None,
         "provider_subscription_id": provider_subscription_id,
+        "product_id": product_id,
         "plan_code": plan_code,
         "status": status,
         "cancel_at_period_end": cancel_at_period_end,
@@ -385,15 +424,69 @@ def _extract_user_subscription_data(payload: dict) -> dict[str, object]:
     }
 
 
+def _resolve_user_id_for_event(
+    db: Session,
+    *,
+    provider: str,
+    user_id: str | None,
+    provider_subscription_id: str,
+    purchase_token: str | None,
+) -> str | None:
+    if user_id:
+        return user_id
+
+    if provider_subscription_id:
+        row = db.execute(
+            sa.text(
+                """
+                SELECT user_id::text AS user_id
+                FROM billing_subscriptions
+                WHERE provider=:provider
+                  AND provider_subscription_id=:sub_id
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """
+            ),
+            {"provider": provider, "sub_id": provider_subscription_id},
+        ).mappings().first()
+        if row:
+            return str(row["user_id"])
+
+    if purchase_token:
+        row = db.execute(
+            sa.text(
+                """
+                SELECT user_id::text AS user_id
+                FROM billing_subscriptions
+                WHERE provider=:provider
+                  AND raw_payload->>'purchase_token'=:purchase_token
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """
+            ),
+            {"provider": provider, "purchase_token": purchase_token},
+        ).mappings().first()
+        if row:
+            return str(row["user_id"])
+    return None
+
+
 def ingest_webhook_event(db: Session, *, provider: str, payload: dict):
     provider_norm = _normalize_provider(provider)
-    event_id = str(payload.get("id") or "").strip()
-    event_type = str(payload.get("type") or "").strip()
+    normalized_payload = normalize_provider_webhook_payload(provider_norm, payload)
+    event_id = str(normalized_payload.get("id") or "").strip()
+    event_type = str(normalized_payload.get("type") or "").strip()
     if not event_id or not event_type:
         raise ValueError("Evento de webhook invalido")
 
-    extracted = _extract_user_subscription_data(payload)
-    user_id = extracted["user_id"]
+    extracted = _extract_user_subscription_data(normalized_payload)
+    user_id = _resolve_user_id_for_event(
+        db,
+        provider=provider_norm,
+        user_id=(str(extracted["user_id"]) if extracted["user_id"] else None),
+        provider_subscription_id=str(extracted["provider_subscription_id"]),
+        purchase_token=(str(normalized_payload.get("data", {}).get("purchase_token")) if isinstance(normalized_payload.get("data"), dict) and normalized_payload.get("data", {}).get("purchase_token") else None),
+    )
 
     inserted = db.execute(
         sa.text(
@@ -409,7 +502,7 @@ def ingest_webhook_event(db: Session, *, provider: str, payload: dict):
             "event_id": event_id,
             "event_type": event_type,
             "user_id": user_id,
-            "payload": json.dumps(payload),
+            "payload": json.dumps(normalized_payload),
         },
     ).mappings().first()
     if not inserted:
@@ -450,12 +543,16 @@ def ingest_webhook_event(db: Session, *, provider: str, payload: dict):
                 provider=provider_norm,
                 provider_customer_id=extracted["provider_customer_id"],  # type: ignore[arg-type]
                 provider_subscription_id=str(extracted["provider_subscription_id"]),
-                plan_code=str(extracted["plan_code"]),
+                plan_code=(
+                    resolve_plan_code_from_product(str(extracted["product_id"]))
+                    if extracted["product_id"]
+                    else str(extracted["plan_code"])
+                ),
                 status=str(extracted["status"]),
                 cancel_at_period_end=bool(extracted["cancel_at_period_end"]),
                 current_period_start=extracted["current_period_start"],  # type: ignore[arg-type]
                 current_period_end=extracted["current_period_end"],  # type: ignore[arg-type]
-                payload=payload,
+                payload=normalized_payload,
             )
             processed = True
             final_status = "processed"
@@ -466,12 +563,16 @@ def ingest_webhook_event(db: Session, *, provider: str, payload: dict):
                 provider=provider_norm,
                 provider_customer_id=extracted["provider_customer_id"],  # type: ignore[arg-type]
                 provider_subscription_id=str(extracted["provider_subscription_id"]),
-                plan_code=str(extracted["plan_code"] or "FREE"),
+                plan_code=(
+                    resolve_plan_code_from_product(str(extracted["product_id"]))
+                    if extracted["product_id"]
+                    else str(extracted["plan_code"] or "FREE")
+                ),
                 status="canceled",
                 cancel_at_period_end=True,
                 current_period_start=extracted["current_period_start"],  # type: ignore[arg-type]
                 current_period_end=extracted["current_period_end"],  # type: ignore[arg-type]
-                payload=payload,
+                payload=normalized_payload,
             )
             processed = True
             final_status = "processed"
@@ -542,3 +643,154 @@ def simulate_subscription(
         },
     )
     return result
+
+
+def _sync_store_validation(
+    db: Session,
+    *,
+    user_id: str,
+    provider: str,
+    provider_customer_id: str | None,
+    provider_subscription_id: str,
+    product_id: str,
+    status: str,
+    cancel_at_period_end: bool,
+    current_period_start: datetime | None,
+    current_period_end: datetime | None,
+    raw_payload: dict,
+):
+    plan_code = resolve_plan_code_from_product(product_id)
+    applied = apply_subscription_state(
+        db,
+        user_id=user_id,
+        provider=provider,
+        provider_customer_id=provider_customer_id,
+        provider_subscription_id=provider_subscription_id,
+        plan_code=plan_code,
+        status=status,
+        cancel_at_period_end=cancel_at_period_end,
+        current_period_start=current_period_start,
+        current_period_end=current_period_end,
+        payload=raw_payload,
+    )
+    return {
+        "provider": provider,
+        "provider_subscription_id": provider_subscription_id,
+        "product_id": product_id,
+        "status": status,
+        "current_period_start": current_period_start,
+        "current_period_end": current_period_end,
+        "entitlement_plan_code": applied["entitlement_plan_code"],
+    }
+
+
+def validate_and_sync_app_store_receipt(
+    db: Session,
+    *,
+    user_id: str,
+    receipt_data: str,
+    environment: str = "auto",
+):
+    result = validate_app_store_receipt(receipt_data, environment=environment)
+    return _sync_store_validation(
+        db,
+        user_id=user_id,
+        provider=result.provider,
+        provider_customer_id=result.provider_customer_id,
+        provider_subscription_id=result.provider_subscription_id,
+        product_id=result.product_id,
+        status=result.status,
+        cancel_at_period_end=result.cancel_at_period_end,
+        current_period_start=result.current_period_start,
+        current_period_end=result.current_period_end,
+        raw_payload=result.raw_payload,
+    )
+
+
+def validate_and_sync_google_play_purchase(
+    db: Session,
+    *,
+    user_id: str,
+    purchase_token: str,
+    package_name: str | None = None,
+):
+    result = validate_google_play_purchase(purchase_token=purchase_token, package_name=package_name)
+    return _sync_store_validation(
+        db,
+        user_id=user_id,
+        provider=result.provider,
+        provider_customer_id=result.provider_customer_id,
+        provider_subscription_id=result.provider_subscription_id,
+        product_id=result.product_id,
+        status=result.status,
+        cancel_at_period_end=result.cancel_at_period_end,
+        current_period_start=result.current_period_start,
+        current_period_end=result.current_period_end,
+        raw_payload=result.raw_payload,
+    )
+
+
+def reconcile_subscriptions(db: Session, *, limit: int = 200):
+    rows = db.execute(
+        sa.text(
+            """
+            SELECT
+                user_id::text AS user_id,
+                provider,
+                provider_subscription_id,
+                raw_payload
+            FROM billing_subscriptions
+            WHERE provider IN ('app_store','google_play')
+              AND status IN ('trialing','active','past_due')
+            ORDER BY updated_at ASC, id ASC
+            LIMIT :limit
+            """
+        ),
+        {"limit": limit},
+    ).mappings().all()
+
+    processed = 0
+    updated = 0
+    skipped = 0
+    errors = 0
+    for row in rows:
+        processed += 1
+        provider = str(row["provider"])
+        payload = row["raw_payload"] if isinstance(row["raw_payload"], dict) else {}
+        try:
+            if provider == "app_store":
+                receipt_data = payload.get("latest_receipt")
+                if not receipt_data:
+                    skipped += 1
+                    continue
+                out = validate_and_sync_app_store_receipt(
+                    db,
+                    user_id=str(row["user_id"]),
+                    receipt_data=str(receipt_data),
+                    environment="auto",
+                )
+                updated += 1 if out else 0
+            elif provider == "google_play":
+                purchase_token = payload.get("purchase_token")
+                package_name = payload.get("package_name")
+                if not purchase_token:
+                    skipped += 1
+                    continue
+                out = validate_and_sync_google_play_purchase(
+                    db,
+                    user_id=str(row["user_id"]),
+                    purchase_token=str(purchase_token),
+                    package_name=(str(package_name) if package_name else None),
+                )
+                updated += 1 if out else 0
+            else:
+                skipped += 1
+        except Exception:
+            errors += 1
+
+    return {
+        "processed": processed,
+        "updated": updated,
+        "skipped": skipped,
+        "errors": errors,
+    }

@@ -53,8 +53,25 @@ class Settings(BaseSettings):
     BILLING_PROVIDER: str = "none"  # none|stripe|app_store|google_play|manual
     BILLING_WEBHOOK_SECRET: str | None = None
     BILLING_REQUIRE_WEBHOOK_SIGNATURE: bool = False
+    BILLING_WEBHOOK_MAX_AGE_SECONDS: int = 300
+    BILLING_WEBHOOK_STRIPE_SECRET: str | None = None
+    BILLING_WEBHOOK_APP_STORE_SECRET: str | None = None
+    BILLING_WEBHOOK_GOOGLE_PLAY_SECRET: str | None = None
     BILLING_PLUS_PLAN_CODE: str = "RIVIO_PLUS"
     BILLING_CHECKOUT_SUCCESS_URL: str = "https://rivio.app/billing/success"
     BILLING_CHECKOUT_CANCEL_URL: str = "https://rivio.app/billing/cancel"
+    BILLING_PRODUCT_PLAN_MAP: str = ""
+
+    # App Store Server-side validation (legacy verifyReceipt flow)
+    APP_STORE_SHARED_SECRET: str | None = None
+    APP_STORE_VERIFY_URL_PROD: str = "https://buy.itunes.apple.com/verifyReceipt"
+    APP_STORE_VERIFY_URL_SANDBOX: str = "https://sandbox.itunes.apple.com/verifyReceipt"
+
+    # Google Play Server-side validation (Play Developer API)
+    GOOGLE_PLAY_PACKAGE_NAME: str | None = None
+    GOOGLE_PLAY_SERVICE_ACCOUNT_EMAIL: str | None = None
+    GOOGLE_PLAY_SERVICE_ACCOUNT_PRIVATE_KEY_PEM: str | None = None
+    GOOGLE_PLAY_TOKEN_URI: str = "https://oauth2.googleapis.com/token"
+    GOOGLE_PLAY_ANDROID_PUBLISHER_SCOPE: str = "https://www.googleapis.com/auth/androidpublisher"
 
 settings = Settings()

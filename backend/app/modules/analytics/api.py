@@ -4,7 +4,9 @@ from sqlalchemy.orm import Session
 from uuid import UUID
 
 from app.api.deps import get_current_user
+from app.core.security import now_utc
 from app.db.session import get_db
+from app.services.entitlements import get_user_contract
 from app.schemas.analytics import (
     AnalyticsDashboardOut,
     AnalyticsPublicDashboardOut,
@@ -575,6 +577,44 @@ def analytics_me_dashboard(
             top_n=top_n,
         )))
     return out
+
+
+@router.get("/me/export")
+def analytics_me_export(
+    ladder: str = Query(..., description="HM|WM|MX"),
+    trend_interval: str = Query(default="match", description="match|week|month"),
+    points: int = Query(default=100, ge=5, le=500),
+    top_n: int = Query(default=10, ge=1, le=50),
+    current=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    contract = get_user_contract(db, str(current.id))
+    if contract.current.plan_code != "RIVIO_PLUS":
+        raise HTTPException(403, "Export disponible solo para Rivio+")
+
+    ladder_norm = _normalize_ladder(ladder)
+    rows = _query_states(db, str(current.id), ladder_norm)
+    if not rows:
+        raise HTTPException(404, "No hay analitica disponible para exportar")
+
+    interval = _normalize_trend_interval(trend_interval)
+    row = rows[0]
+    state = _private_state_out(row)
+    payload = _dashboard_payload(
+        db,
+        user_id=str(current.id),
+        ladder_code=str(row["ladder_code"]),
+        state=state,
+        trend_interval=interval,
+        points=points,
+        top_n=top_n,
+    )
+    return {
+        "exported_at": now_utc().isoformat(),
+        "plan_code": contract.current.plan_code,
+        "ladder_code": str(row["ladder_code"]),
+        **payload,
+    }
 
 
 @router.get("/users/{user_id}", response_model=list[AnalyticsPublicOut])

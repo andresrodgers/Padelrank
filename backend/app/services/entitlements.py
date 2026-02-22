@@ -29,8 +29,8 @@ _FREE_FEATURES = EntitlementFeatureSetOut(
         "recent_10_summary",
     ],
     analytics_series=[
-        "rating_trend_last_20",
-        "recent_win_rate_last_10",
+        "rating_trend",
+        "rolling_win_rate_timeline_10",
     ],
     export_enabled=False,
     ads_enabled=True,
@@ -58,6 +58,7 @@ _PLUS_FEATURES = EntitlementFeatureSetOut(
         "streak_timeline",
         "top_partners",
         "top_rivals",
+        "analytics_export_json",
     ],
     export_enabled=True,
     ads_enabled=False,

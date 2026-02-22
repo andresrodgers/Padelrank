@@ -77,3 +77,24 @@ class BillingSimulateSubscriptionOut(BaseModel):
     provider: BillingProvider
     provider_subscription_id: str
     entitlement_plan_code: Literal["FREE", "RIVIO_PLUS"]
+
+
+class AppStoreValidateIn(BaseModel):
+    receipt_data: str = Field(..., min_length=20)
+    environment: Literal["auto", "production", "sandbox"] = "auto"
+
+
+class GooglePlayValidateIn(BaseModel):
+    purchase_token: str = Field(..., min_length=8, max_length=4096)
+    package_name: str | None = Field(default=None, min_length=3, max_length=255)
+
+
+class BillingStoreValidationOut(BaseModel):
+    ok: bool = True
+    provider: BillingProvider
+    provider_subscription_id: str
+    product_id: str
+    status: BillingSubscriptionStatus
+    current_period_start: datetime | None = None
+    current_period_end: datetime | None = None
+    entitlement_plan_code: Literal["FREE", "RIVIO_PLUS"]
